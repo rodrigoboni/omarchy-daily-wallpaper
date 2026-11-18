@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+# Multi-source wallpaper fetcher for Omarchy (Bing, NASA APOD, Met, NASA Images, Unsplash).
+# Shuffled deck: each successful run removes that source; when empty, reshuffle.
+# Requires: curl, jq. Optional: identify/magick for post-download size checks.
+#
+# Usage:
+#   fetch.sh --config ~/.config/omarchy/daily-wallpaper/config.json \
+#            [--min-width N] [--min-height N]
+# Prints one JSON object to stdout on completion / failure.
+
+set -euo pipefail
+
+CONFIG_PATH=""
+MIN_WIDTH_OVERRIDE=""
+MIN_HEIGHT_OVERRIDE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config)
+      CONFIG_PATH="${2:-}"
+      shift 2
+      ;;
+    --min-width)
+      MIN_WIDTH_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --min-height)
+      MIN_HEIGHT_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/omarchy/daily-wallpaper"
+QUEUE_FILE="${STATE_DIR}/queue.json"
+LOG_FILE="${STATE_DIR}/fetch.log"
+LOG_MAX_LINES=400
+WALLPAPER_DIR="${HOME}/Pictures/daily-wallpapers"
+SOURCES_CSV="bing,nasa_images,met"
+KEEP_DAYS="7"
+KEYWORDS="moon,mars,nebula,galaxy,hubble,earth,aurora"
+MET_QUERY=""
+UNSPLASH_QUERY=""
+MIN_WIDTH="0"
+MIN_HEIGHT="0"
+APPLY_LOCK="1"
+NASA_API_KEY=""
+UNSPLASH_ACCESS_KEY=""
+BING_MKT="en-US"
+BING_IDX="0"
+BING_IMAGE_COUNT="8"
+NASA_MAX_PAGE="10"
+NASA_SEARCH_ATTEMPTS="8"
+MATCH_RES="1"
+
+if [[ -n "${CONFIG_PATH}" && -f "${CONFIG_PATH}" ]]; then
+  eval "$(jq -r '
+    def s($k; $d):
+      (($k | tostring) as $key
+       | if has($key) and (.[$key] != null) then .[$key] else $d end);
+    def b($k; $d):
+      (s($k; $d) | if type == "boolean" then (if . then "1" else "0" end)
+                   elif . == true or . == "true" or . == 1 or . == "1" then "1"
+                   else "0" end);
+    def csv($k; $d):
+      (s($k; $d)
+       | if type == "array" then map(tostring) | join(",")
+         else tostring end);
+    [
+      "SOURCES_CSV=" + (csv("sources"; "bing,nasa_images,met") | @sh),
+      "KEEP_DAYS=" + (s("keepDays"; 7) | tostring | @sh),
+      "WALLPAPER_DIR=" + (s("wallpaperDir"; "") | tostring | @sh),
+      "KEYWORDS=" + (s("keywords"; "moon,mars,nebula") | tostring | @sh),
+      "MET_QUERY=" + (s("metQuery"; "") | tostring | @sh),
+      "UNSPLASH_QUERY=" + (s("unsplashQuery"; "") | tostring | @sh),
+      "APPLY_LOCK=" + (b("applyToLockScreen"; true) | @sh),
+      "NASA_API_KEY=" + (s("nasaApiKey"; "") | tostring | @sh),
+      "UNSPLASH_ACCESS_KEY=" + (s("unsplashAccessKey"; "") | tostring | @sh),
+      "BING_MKT=" + (s("bingMkt"; "en-US") | tostring | @sh),
+      "MATCH_RES=" + (b("matchResolution"; true) | @sh)
+    ] | .[]
+  ' "${CONFIG_PATH}")"
+fi
+
+if [[ -z "${WALLPAPER_DIR}" ]]; then
+  WALLPAPER_DIR="${HOME}/Pictures/daily-wallpapers"
+elif [[ "${WALLPAPER_DIR}" == ~* ]]; then
+  WALLPAPER_DIR="${WALLPAPER_DIR/#\~/${HOME}}"
+fi
+
+if [[ -n "${MIN_WIDTH_OVERRIDE}" ]]; then
+  MIN_WIDTH="${MIN_WIDTH_OVERRIDE}"
+elif [[ "${MATCH_RES:-1}" != "1" ]]; then
+  MIN_WIDTH="0"
+fi
+if [[ -n "${MIN_HEIGHT_OVERRIDE}" ]]; then
+  MIN_HEIGHT="${MIN_HEIGHT_OVERRIDE}"
+elif [[ "${MATCH_RES:-1}" != "1" ]]; then
+  MIN_HEIGHT="0"
+fi
+
+mkdir -p "${WALLPAPER_DIR}" "${STATE_DIR}"
+
+trim_log() {
+  [[ -f "${LOG_FILE}" ]] || return 0
+  local lines
+  lines="$(wc -l <"${LOG_FILE}" 2>/dev/null || echo 0)"
+  [[ "${lines}" =~ ^[0-9]+$ ]] || return 0
+  if ((lines > LOG_MAX_LINES)); then
+    tail -n "${LOG_MAX_LINES}" "${LOG_FILE}" >"${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "${LOG_FILE}"
+  fi
+}
+
+# Append one JSONL event. Never log secrets.
+log_event() {
+  local event="$1" source="${2:-}" ok_flag="${3:-0}" error="${4:-}" path="${5:-}"
+  local ts
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  jq -nc \
+    --arg ts "${ts}" \
+    --arg event "${event}" \
+    --arg source "${source}" \
+    --argjson ok "$([[ "${ok_flag}" == "1" ]] && echo true || echo false)" \
+    --arg error "${error}" \
+    --arg path "${path}" \
+    '{ts:$ts,event:$event,source:$source,ok:$ok,error:$error,path:$path}' >>"${LOG_FILE}" 2>/dev/null || true
+  trim_log
+}
+
+emit() {
+  jq -nc \
+    --arg ok "${1}" \
+    --arg source "${2:-}" \
+    --arg path "${3:-}" \
+    --arg error "${4:-}" \
+    '{ok: ($ok == "1"), source: $source, path: $path, error: $error}'
+}
+
+fail() {
+  log_event "run" "" 0 "$1" ""
+  emit 0 "" "" "$1"
+  exit 0
+}
+
+uri_encode() {
+  jq -rn --arg s "$1" '$s|@uri'
+}
+
+_normalize_int() {
+  local v="${1}" d="${2}"
+  [[ "${v}" =~ ^[0-9]+$ ]] || v="${d}"
+  echo "${v}"
+}
+
+KEEP_DAYS="$(_normalize_int "${KEEP_DAYS}" 7)"
+((KEEP_DAYS < 1)) && KEEP_DAYS=1
+MIN_WIDTH="$(_normalize_int "${MIN_WIDTH}" 0)"
+MIN_HEIGHT="$(_normalize_int "${MIN_HEIGHT}" 0)"
+BING_IMAGE_COUNT="$(_normalize_int "${BING_IMAGE_COUNT}" 8)"
+((BING_IMAGE_COUNT < 1)) && BING_IMAGE_COUNT=1
+((BING_IMAGE_COUNT > 8)) && BING_IMAGE_COUNT=8
+BING_IDX="$(_normalize_int "${BING_IDX}" 0)"
+NASA_MAX_PAGE="$(_normalize_int "${NASA_MAX_PAGE}" 10)"
+NASA_SEARCH_ATTEMPTS="$(_normalize_int "${NASA_SEARCH_ATTEMPTS}" 8)"
+
+# Met / Unsplash accept one subject string. If the user pastes a comma list
+# (same style as keywords), pick one term at random each run.
+pick_query_term() {
+  local raw="${1:-}" fallback="${2:-landscape}"
+  local -a parts=() cleaned=() p
+  [[ -z "${raw}" ]] && raw="${KEYWORDS}"
+  IFS=',' read -ra parts <<< "${raw}"
+  for p in "${parts[@]}"; do
+    p="${p#"${p%%[![:space:]]*}"}"
+    p="${p%"${p##*[![:space:]]}"}"
+    [[ -n "${p}" ]] && cleaned+=("${p}")
+  done
+  if ((${#cleaned[@]} == 0)); then
+    echo -n "${fallback}"
+    return 0
+  fi
+  echo -n "${cleaned[$((RANDOM % ${#cleaned[@]}))]}"
+}
+
+MET_QUERY="$(pick_query_term "${MET_QUERY}" "landscape")"
+UNSPLASH_QUERY="$(pick_query_term "${UNSPLASH_QUERY}" "landscape")"
+
+_nasa_key_ok() {
+  [[ -n "${NASA_API_KEY}" ]] || return 1
+  [[ "${NASA_API_KEY}" != "DEMO_KEY" ]] || return 1
+  return 0
+}
+
+_shuffle_lines() {
+  if command -v shuf >/dev/null 2>&1; then
+    shuf
+  else
+    awk 'BEGIN { srand(); } { print rand() "\t" $0 }' | sort -n | cut -f2-
+  fi
+}
+
+image_dims() {
+  local file="$1"
+  if command -v identify >/dev/null 2>&1; then
+    identify -format '%w %h' "${file}[0]" 2>/dev/null || true
+  elif command -v magick >/dev/null 2>&1; then
+    magick identify -format '%w %h' "${file}[0]" 2>/dev/null || true
+  fi
+}
+
+accepts_dims() {
+  local file="$1" dims w h
+  ((MIN_WIDTH == 0 && MIN_HEIGHT == 0)) && return 0
+  dims="$(image_dims "${file}")"
+  [[ -n "${dims}" ]] || return 0
+  w="${dims%% *}"
+  h="${dims##* }"
+  [[ "${w}" =~ ^[0-9]+$ && "${h}" =~ ^[0-9]+$ ]] || return 0
+  ((MIN_WIDTH > 0 && w < MIN_WIDTH)) && return 1
+  ((MIN_HEIGHT > 0 && h < MIN_HEIGHT)) && return 1
+  return 0
+}
+
+# --- Bing ---
+
+fetch_bing_json() {
+  curl -fsSL --max-time 30 \
+    "https://www.bing.com/HPImageArchive.aspx?format=js&idx=${BING_IDX}&n=${BING_IMAGE_COUNT}&mkt=${BING_MKT}"
+}
+
+pick_random_urlbase() {
+  jq -r --argjson r "${RANDOM}" '
+    (.images // [])
+    | map(select((.wp // true) != false))
+    | if length == 0 then (.images // []) else . end
+    | if length == 0 then empty
+      else .[$r % length].urlbase
+      end
+  '
+}
+
+resolve_bing_image_url() {
+  local path="$1" base="https://www.bing.com${path}" suf url code
+  local -a candidates=()
+  if ((MIN_WIDTH >= 2560 || MIN_HEIGHT >= 1440)); then
+    candidates=(_UHD.jpg _1920x1080.jpg _1280x720.jpg)
+  elif ((MIN_WIDTH >= 1280 || MIN_HEIGHT >= 720)); then
+    candidates=(_1920x1080.jpg _UHD.jpg _1280x720.jpg)
+  else
+    candidates=(_UHD.jpg _1920x1080.jpg _1280x720.jpg)
+  fi
+  for suf in "${candidates[@]}"; do
+    url="${base}${suf}"
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "${url}")" || true
+    if [[ "${code}" == "200" ]]; then
+      echo -n "${url}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+try_source_bing() {
+  local json path url
+  json="$(fetch_bing_json)" || return 1
+  path="$(pick_random_urlbase <<< "${json}")"
+  [[ -n "${path}" ]] || return 1
+  url="$(resolve_bing_image_url "${path}")" || return 1
+  echo -n "${url}"
+}
+
+# --- NASA APOD ---
+
+try_source_apod() {
+  _nasa_key_ok || return 1
+  local json url media
+  json="$(curl -fsSL --max-time 30 "https://api.nasa.gov/planetary/apod?api_key=${NASA_API_KEY}&thumbs=true")" || return 1
+  media="$(jq -r '.media_type // "image"' <<< "${json}")"
+  if [[ "${media}" == "image" ]]; then
+    url="$(jq -r '(.hdurl // .url) // empty' <<< "${json}")"
+  elif [[ "${media}" == "video" ]]; then
+    url="$(jq -r '(.thumbnail_url // "")' <<< "${json}")"
+  else
+    return 1
+  fi
+  [[ -n "${url}" && "${url}" != "null" ]] || return 1
+  echo -n "${url}"
+}
+
+# --- NASA Image Library ---
+
+pick_random_query() {
+  local -a parts=() cleaned=() p
+  IFS=',' read -ra parts <<< "${KEYWORDS}"
+  for p in "${parts[@]}"; do
+    p="${p#"${p%%[![:space:]]*}"}"
+    p="${p%"${p##*[![:space:]]}"}"
+    [[ -n "${p}" ]] && cleaned+=("${p}")
+  done
+  ((${#cleaned[@]} > 0)) || return 1
+  echo -n "${cleaned[$((RANDOM % ${#cleaned[@]}))]}"
+}
+
+pick_best_asset_href() {
+  # Prefer known-large assets. Missing width/height is allowed here — the
+  # post-download identify check enforces MIN_WIDTH/MIN_HEIGHT. Rejecting
+  # unknown sizes up front left NASA Images empty for most results.
+  jq -r --argjson minw "${MIN_WIDTH}" --argjson minh "${MIN_HEIGHT}" '
+    def num: if type == "number" then . elif type == "string" then (tonumber? // 0) else 0 end;
+    def has_dim($k): (.[$k] != null) and ((.[$k] | num) > 0);
+    def passes:
+      ((has_dim("width") | not) or ($minw == 0) or ((.width | num) >= $minw)) and
+      ((has_dim("height") | not) or ($minh == 0) or ((.height | num) >= $minh));
+    (.links // [])
+    | map(select(.href | ascii_downcase | test("\\.(jpg|jpeg|png)$")))
+    | map(select(passes))
+    | if length == 0 then empty
+      else
+        max_by([
+          (if (.href | ascii_downcase | test("~large\\.")) then 1000
+           elif (.href | ascii_downcase | test("~orig\\.")) then 900
+           elif (.href | ascii_downcase | test("~medium\\.")) then 800
+           elif (.href | ascii_downcase | test("~small\\.")) then 400
+           elif (.href | ascii_downcase | test("~thumb\\.")) then 200
+           else 0 end),
+          ((.size // 0) | num)
+        ])
+        | .href
+      end
+  '
+}
+
+try_source_nasa_images() {
+  local attempts=0 q page url json n idx item href
+  while ((attempts < NASA_SEARCH_ATTEMPTS)); do
+    q="$(pick_random_query)" || return 1
+    page=$((RANDOM % (NASA_MAX_PAGE + 1)))
+    url="https://images-api.nasa.gov/search?q=$(uri_encode "${q}")&media_type=image&page=${page}"
+    json="$(curl -fsSL --max-time 30 "${url}")" || {
+      ((++attempts))
+      continue
+    }
+    n="$(jq '.collection.items | length' <<< "${json}")"
+    if ((n == 0)); then
+      ((++attempts))
+      continue
+    fi
+    idx=$((RANDOM % n))
+    item="$(jq -c --argjson i "${idx}" '.collection.items[$i]' <<< "${json}")"
+    href="$(pick_best_asset_href <<< "${item}")"
+    if [[ -n "${href}" ]]; then
+      echo -n "${href}"
+      return 0
+    fi
+    ((++attempts))
+  done
+  return 1
+}
+
+# --- Met Museum ---
+
+try_source_met() {
+  local json total n oid detail url maxpick qenc
+  qenc="$(uri_encode "${MET_QUERY}")"
+  json="$(curl -fsSL --max-time 30 "https://collectionapi.metmuseum.org/public/collection/v1/search?hasImages=true&q=${qenc}")" || return 1
+  total="$(jq '.total // 0' <<< "${json}")"
+  ((total > 0)) || return 1
+  n="$(jq '[.objectIDs[]?] | length' <<< "${json}")"
+  ((n > 0)) || return 1
+  maxpick=40
+  ((n > maxpick)) && n=${maxpick}
+  oid="$(jq -r --argjson r "${RANDOM}" --argjson lim "${n}" '.objectIDs[0:$lim] | .[$r % length]' <<< "${json}")"
+  [[ -n "${oid}" && "${oid}" != "null" ]] || return 1
+  detail="$(curl -fsSL --max-time 30 "https://collectionapi.metmuseum.org/public/collection/v1/objects/${oid}")" || return 1
+  url="$(jq -r '.primaryImage // empty' <<< "${detail}")"
+  [[ -n "${url}" && "${url}" != "null" ]] || return 1
+  echo -n "${url}"
+}
+
+# --- Unsplash ---
+
+try_source_unsplash() {
+  [[ -n "${UNSPLASH_ACCESS_KEY}" ]] || return 1
+  local json url qenc
+  qenc="$(uri_encode "${UNSPLASH_QUERY}")"
+  json="$(curl -fsSL --max-time 30 \
+    -H "Authorization: Client-ID ${UNSPLASH_ACCESS_KEY}" \
+    "https://api.unsplash.com/photos/random?orientation=landscape&content_filter=high&query=${qenc}")" || return 1
+  url="$(jq -r '.urls.raw // .urls.full // .urls.regular // empty' <<< "${json}")"
+  [[ -n "${url}" && "${url}" != "null" ]] || return 1
+  local w="${MIN_WIDTH}"
+  ((w < 1920)) && w=3840
+  case "${url}" in
+    *\?*) echo -n "${url}&w=${w}&q=85" ;;
+    *) echo -n "${url}?w=${w}&q=85" ;;
+  esac
+}
+
+try_source_by_name() {
+  case "$1" in
+    bing) try_source_bing ;;
+    apod) try_source_apod ;;
+    met) try_source_met ;;
+    nasa_images) try_source_nasa_images ;;
+    unsplash) try_source_unsplash ;;
+    *) return 1 ;;
+  esac
+}
+
+# --- deck ---
+
+parse_sources_csv() {
+  local raw="${SOURCES_CSV}" p
+  local -a parts=()
+  IFS=',' read -ra parts <<< "${raw}"
+  for p in "${parts[@]}"; do
+    p="${p#"${p%%[![:space:]]*}"}"
+    p="${p%"${p##*[![:space:]]}"}"
+    [[ -n "${p}" ]] && printf '%s\n' "${p}"
+  done
+}
+
+eligible_sources_list() {
+  local -a raw=() filtered=()
+  local s
+  mapfile -t raw < <(parse_sources_csv)
+  if ((${#raw[@]} == 0)); then
+    raw=(bing nasa_images met)
+  fi
+  for s in "${raw[@]}"; do
+    case "${s}" in
+      bing | met | nasa_images) filtered+=("${s}") ;;
+      apod)
+        if _nasa_key_ok; then
+          filtered+=("apod")
+        fi
+        ;;
+      unsplash)
+        if [[ -n "${UNSPLASH_ACCESS_KEY}" ]]; then
+          filtered+=("unsplash")
+        fi
+        ;;
+    esac
+  done
+  ((${#filtered[@]} > 0)) || return 1
+  printf '%s\n' "${filtered[@]}"
+}
+
+queue_load_remaining() {
+  if [[ ! -f "${QUEUE_FILE}" ]]; then
+    echo "[]"
+    return 0
+  fi
+  jq -c '.remaining // []' "${QUEUE_FILE}" 2>/dev/null || echo "[]"
+}
+
+queue_save_remaining() {
+  local json="$1"
+  jq -nc --argjson r "${json}" '{remaining: $r}' >"${QUEUE_FILE}.tmp"
+  mv "${QUEUE_FILE}.tmp" "${QUEUE_FILE}"
+}
+
+queue_reshuffle() {
+  local -a list=()
+  mapfile -t list < <(eligible_sources_list) || return 1
+  ((${#list[@]} > 0)) || return 1
+  local shuffled
+  shuffled="$(printf '%s\n' "${list[@]}" | _shuffle_lines | jq -R -s -c 'split("\n") | map(select(length>0))')"
+  queue_save_remaining "${shuffled}"
+  echo "${shuffled}"
+}
+
+download_image() {
+  local image_url="$1" prefix="$2"
+  local base ext ext_lc stamp rand dest tmp
+  base="${image_url%%\?*}"
+  ext="${base##*.}"
+  ext_lc="$(printf '%s' "${ext}" | tr '[:upper:]' '[:lower:]')"
+  case "${ext_lc}" in
+    jpg | jpeg | png | webp | gif) ;;
+    *) ext_lc="jpg" ;;
+  esac
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  rand="$(printf '%04x%04x' "${RANDOM}" "${RANDOM}")"
+  dest="${WALLPAPER_DIR}/wp-${prefix}-${stamp}-${rand}.${ext_lc}"
+  tmp="${dest}.part"
+  curl -fsSL --max-time 120 "${image_url}" -o "${tmp}"
+  if ! accepts_dims "${tmp}"; then
+    rm -f "${tmp}"
+    return 1
+  fi
+  mv "${tmp}" "${dest}"
+  echo -n "${dest}"
+}
+
+apply_wallpaper() {
+  local dest="$1"
+  if [[ "${APPLY_LOCK}" == "1" ]]; then
+    omarchy theme bg set "${dest}" >/dev/null
+  else
+    omarchy-shell -q background set "${dest}" >/dev/null || omarchy theme bg set "${dest}" >/dev/null
+  fi
+}
+
+prune_old() {
+  find "${WALLPAPER_DIR}" -maxdepth 1 -type f \
+    \( -name 'wp-*' -o -name 'bing-*' \) \
+    -mtime "+${KEEP_DAYS}" -delete 2>/dev/null || true
+}
+
+# Sets DECK_IDX / DECK_SRC / DECK_DEST / DECK_REM on success.
+try_deck() {
+  local remaining_json="$1"
+  local -a remaining_arr=()
+  local i src url dest=""
+  DECK_IDX=-1
+  DECK_SRC=""
+  DECK_DEST=""
+  DECK_REM="${remaining_json}"
+  mapfile -t remaining_arr < <(jq -r '.[]' <<< "${remaining_json}")
+  ((${#remaining_arr[@]} > 0)) || return 1
+  for i in "${!remaining_arr[@]}"; do
+    src="${remaining_arr[i]}"
+    if url="$(try_source_by_name "${src}")"; then
+      if dest="$(download_image "${url}" "${src}")"; then
+        log_event "attempt" "${src}" 1 "" "${dest}"
+        DECK_IDX="${i}"
+        DECK_SRC="${src}"
+        DECK_DEST="${dest}"
+        return 0
+      fi
+      log_event "attempt" "${src}" 0 "download failed or image too small" ""
+    else
+      log_event "attempt" "${src}" 0 "source unavailable" ""
+    fi
+  done
+  return 1
+}
+
+main() {
+  local remaining_json n new_rem
+  log_event "start" "" 1 "" ""
+  remaining_json="$(queue_load_remaining)"
+  n="$(jq 'length' <<< "${remaining_json}")"
+  if ((n == 0)); then
+    remaining_json="$(queue_reshuffle)" || fail "no eligible sources (check API keys / source list)"
+    log_event "reshuffle" "" 1 "empty deck" ""
+  fi
+
+  if ! try_deck "${remaining_json}"; then
+    # Remaining entries can all be broken this cycle (e.g. Met 410 + APOD
+    # timeout). Reshuffle once so Change now can still use healthy sources.
+    remaining_json="$(queue_reshuffle)" || fail "no eligible sources (check API keys / source list)"
+    log_event "reshuffle" "" 1 "deck exhausted" ""
+    if ! try_deck "${remaining_json}"; then
+      fail "all sources failed (APIs down, bad keys, or no image large enough)"
+    fi
+  fi
+
+  apply_wallpaper "${DECK_DEST}"
+  prune_old
+  new_rem="$(jq -c --argjson i "${DECK_IDX}" 'del(.[$i])' <<< "${DECK_REM}")"
+  queue_save_remaining "${new_rem}"
+  log_event "run" "${DECK_SRC}" 1 "" "${DECK_DEST}"
+  emit 1 "${DECK_SRC}" "${DECK_DEST}" ""
+}
+
+main "$@"
