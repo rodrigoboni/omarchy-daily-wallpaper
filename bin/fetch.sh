@@ -892,8 +892,9 @@ prune_old() {
 # Sets DECK_IDX / DECK_SRC / DECK_DEST / DECK_REM on success.
 try_deck() {
   local remaining_json="$1"
-  local -a remaining_arr=()
+  local -a remaining_arr=() eligible_arr=()
   local i src url dest="" cur cur_hash dest_hash dest_abs
+  local -A eligible_set=()
   DECK_IDX=-1
   DECK_SRC=""
   DECK_DEST=""
@@ -901,10 +902,16 @@ try_deck() {
   cur="$(current_wallpaper_path)"
   cur_hash=""
   [[ -n "${cur}" && -f "${cur}" ]] && cur_hash="$(sha256_file "${cur}")"
+  mapfile -t eligible_arr < <(eligible_sources_list) || true
+  for src in "${eligible_arr[@]}"; do
+    eligible_set["${src}"]=1
+  done
   mapfile -t remaining_arr < <(jq -r '.[]' <<< "${remaining_json}")
   ((${#remaining_arr[@]} > 0)) || return 1
   for i in "${!remaining_arr[@]}"; do
     src="${remaining_arr[i]}"
+    # Ignore stale queue entries for sources the user disabled.
+    [[ -n "${eligible_set[$src]+x}" ]] || continue
     if url="$(try_source_by_name "${src}")"; then
       if dest="$(download_image "${url}" "${src}")"; then
         dest_abs="$(readlink -f "${dest}" 2>/dev/null || echo "${dest}")"
