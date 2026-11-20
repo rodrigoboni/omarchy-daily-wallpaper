@@ -475,6 +475,7 @@ Panel {
               Binding on text {
                 value: String(root.cfg.wallpaperDir || "")
                 when: !wallpaperDirField.activeFocus
+                restoreMode: Binding.RestoreNone
               }
             }
           }
@@ -526,6 +527,7 @@ Panel {
               Binding on text {
                 value: String(root.cfg.keywords || "")
                 when: !keywordsField.activeFocus
+                restoreMode: Binding.RestoreNone
               }
             }
           }
@@ -555,6 +557,7 @@ Panel {
               Binding on text {
                 value: String(root.cfg.metQuery || "")
                 when: !metQueryField.activeFocus
+                restoreMode: Binding.RestoreNone
               }
             }
           }
@@ -584,6 +587,7 @@ Panel {
               Binding on text {
                 value: String(root.cfg.unsplashQuery || "")
                 when: !unsplashQueryField.activeFocus
+                restoreMode: Binding.RestoreNone
               }
             }
           }
@@ -676,6 +680,7 @@ Panel {
               Binding on text {
                 value: String(root.cfg.nasaApiKey || "")
                 when: !nasaKeyField.activeFocus
+                restoreMode: Binding.RestoreNone
               }
             }
           }
@@ -701,6 +706,7 @@ Panel {
               Binding on text {
                 value: String(root.cfg.unsplashAccessKey || "")
                 when: !unsplashKeyField.activeFocus
+                restoreMode: Binding.RestoreNone
               }
             }
           }
@@ -725,6 +731,7 @@ Panel {
               Binding on text {
                 value: String(root.cfg.bingMkt || "en-US")
                 when: !bingMktField.activeFocus
+                restoreMode: Binding.RestoreNone
               }
             }
           }
