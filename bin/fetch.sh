@@ -223,10 +223,27 @@ curl_with_config() {
   (umask 077; : >"${cfg}") || { rm -rf -- "${work}"; return 1; }
   chmod 600 -- "${cfg}" || { rm -rf -- "${work}"; return 1; }
   printf '%s\n' "${body}" >"${cfg}"
-  curl -fsSL --max-time "${max_time}" -K "${cfg}" "$@" || ec=$?
+  curl_https -fsSL --max-time "${max_time}" -K "${cfg}" "$@" || ec=$?
   rm -rf -- "${work}"
   return "${ec}"
 }
+
+# HTTPS only for requests and redirects (provider URLs / CDNs).
+curl_https() {
+  curl --proto '=https' --proto-redir '=https' "$@"
+}
+
+require_https_url() {
+  case "${1:-}" in
+    https://*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Transfer / decode caps for wallpaper downloads (advisory hardening).
+MAX_DOWNLOAD_BYTES=$((50 * 1024 * 1024))   # 50 MiB on the wire
+MIN_DOWNLOAD_BYTES=2048                    # reject empty / tiny failures
+MAX_DECODED_PIXELS=$((100 * 1000 * 1000))  # 100 megapixels decoded
 
 _normalize_int() {
   local v="${1}" d="${2}"
@@ -290,23 +307,52 @@ image_dims() {
   fi
 }
 
-accepts_dims() {
-  local file="$1" dims w h
-  ((MIN_WIDTH == 0 && MIN_HEIGHT == 0)) && return 0
+image_mime() {
+  local file="$1" mime=""
+  if command -v file >/dev/null 2>&1; then
+    mime="$(file -b --mime-type -- "${file}" 2>/dev/null || true)"
+  fi
+  printf '%s' "${mime}"
+}
+
+# Require a real, bounded image before apply. Enforces transfer size, image MIME,
+# optional min resolution, and decoded pixel cap when identify/magick is present.
+validate_downloaded_image() {
+  local file="$1" size=0 mime dims w h pixels
+  [[ -f "${file}" ]] || return 1
+  size="$(stat -c '%s' -- "${file}" 2>/dev/null || echo 0)"
+  [[ "${size}" =~ ^[0-9]+$ ]] || return 1
+  ((size >= MIN_DOWNLOAD_BYTES)) || return 1
+  ((size <= MAX_DOWNLOAD_BYTES)) || return 1
+
+  mime="$(image_mime "${file}")"
+  case "${mime}" in
+    image/jpeg | image/png | image/webp | image/gif) ;;
+    *) return 1 ;;
+  esac
+
   dims="$(image_dims "${file}")"
-  [[ -n "${dims}" ]] || return 0
-  w="${dims%% *}"
-  h="${dims##* }"
-  [[ "${w}" =~ ^[0-9]+$ && "${h}" =~ ^[0-9]+$ ]] || return 0
-  ((MIN_WIDTH > 0 && w < MIN_WIDTH)) && return 1
-  ((MIN_HEIGHT > 0 && h < MIN_HEIGHT)) && return 1
+  if [[ -n "${dims}" ]]; then
+    w="${dims%% *}"
+    h="${dims##* }"
+    [[ "${w}" =~ ^[0-9]+$ && "${h}" =~ ^[0-9]+$ ]] || return 1
+    ((w > 0 && h > 0)) || return 1
+    pixels=$((w * h))
+    ((pixels <= MAX_DECODED_PIXELS)) || return 1
+    ((MIN_WIDTH > 0 && w < MIN_WIDTH)) && return 1
+    ((MIN_HEIGHT > 0 && h < MIN_HEIGHT)) && return 1
+  elif command -v identify >/dev/null 2>&1 || command -v magick >/dev/null 2>&1; then
+    # Decoder present but could not read the file — treat as corrupt.
+    return 1
+  fi
+  # Without ImageMagick: MIME + byte caps still apply; decode size cannot be checked.
   return 0
 }
 
 # --- Bing ---
 
 fetch_bing_json() {
-  curl -fsSL --max-time 30 \
+  curl_https -fsSL --max-time 30 \
     "https://www.bing.com/HPImageArchive.aspx?format=js&idx=${BING_IDX}&n=${BING_IMAGE_COUNT}&mkt=${BING_MKT}"
 }
 
@@ -333,7 +379,8 @@ resolve_bing_image_url() {
   fi
   for suf in "${candidates[@]}"; do
     url="${base}${suf}"
-    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "${url}")" || true
+    require_https_url "${url}" || continue
+    code="$(curl_https -sS -o /dev/null -w '%{http_code}' --max-time 20 "${url}")" || true
     if [[ "${code}" == "200" ]]; then
       echo -n "${url}"
       return 0
@@ -369,6 +416,7 @@ try_source_apod() {
     return 1
   fi
   [[ -n "${url}" && "${url}" != "null" ]] || return 1
+  require_https_url "${url}" || return 1
   echo -n "${url}"
 }
 
@@ -421,7 +469,7 @@ try_source_nasa_images() {
     q="$(pick_random_query)" || return 1
     page=$((RANDOM % (NASA_MAX_PAGE + 1)))
     url="https://images-api.nasa.gov/search?q=$(uri_encode "${q}")&media_type=image&page=${page}"
-    json="$(curl -fsSL --max-time 30 "${url}")" || {
+    json="$(curl_https -fsSL --max-time 30 "${url}")" || {
       ((++attempts))
       continue
     }
@@ -433,7 +481,7 @@ try_source_nasa_images() {
     idx=$((RANDOM % n))
     item="$(jq -c --argjson i "${idx}" '.collection.items[$i]' <<< "${json}")"
     href="$(pick_best_asset_href <<< "${item}")"
-    if [[ -n "${href}" ]]; then
+    if [[ -n "${href}" ]] && require_https_url "${href}"; then
       echo -n "${href}"
       return 0
     fi
@@ -447,7 +495,7 @@ try_source_nasa_images() {
 try_source_met() {
   local json total n oid detail url maxpick qenc
   qenc="$(uri_encode "${MET_QUERY}")"
-  json="$(curl -fsSL --max-time 30 "https://collectionapi.metmuseum.org/public/collection/v1/search?hasImages=true&q=${qenc}")" || return 1
+  json="$(curl_https -fsSL --max-time 30 "https://collectionapi.metmuseum.org/public/collection/v1/search?hasImages=true&q=${qenc}")" || return 1
   total="$(jq '.total // 0' <<< "${json}")"
   ((total > 0)) || return 1
   n="$(jq '[.objectIDs[]?] | length' <<< "${json}")"
@@ -456,9 +504,10 @@ try_source_met() {
   ((n > maxpick)) && n=${maxpick}
   oid="$(jq -r --argjson r "${RANDOM}" --argjson lim "${n}" '.objectIDs[0:$lim] | .[$r % length]' <<< "${json}")"
   [[ -n "${oid}" && "${oid}" != "null" ]] || return 1
-  detail="$(curl -fsSL --max-time 30 "https://collectionapi.metmuseum.org/public/collection/v1/objects/${oid}")" || return 1
+  detail="$(curl_https -fsSL --max-time 30 "https://collectionapi.metmuseum.org/public/collection/v1/objects/${oid}")" || return 1
   url="$(jq -r '.primaryImage // empty' <<< "${detail}")"
   [[ -n "${url}" && "${url}" != "null" ]] || return 1
+  require_https_url "${url}" || return 1
   echo -n "${url}"
 }
 
@@ -474,6 +523,7 @@ try_source_unsplash() {
     "https://api.unsplash.com/photos/random?orientation=landscape&content_filter=high&query=${qenc}")" || return 1
   url="$(jq -r '.urls.raw // .urls.full // .urls.regular // empty' <<< "${json}")"
   [[ -n "${url}" && "${url}" != "null" ]] || return 1
+  require_https_url "${url}" || return 1
   local w="${MIN_WIDTH}"
   ((w < 1920)) && w=3840
   case "${url}" in
@@ -559,6 +609,7 @@ queue_reshuffle() {
 download_image() {
   local image_url="$1" prefix="$2"
   local base ext ext_lc stamp rand dest tmp
+  require_https_url "${image_url}" || return 1
   base="${image_url%%\?*}"
   ext="${base##*.}"
   ext_lc="$(printf '%s' "${ext}" | tr '[:upper:]' '[:lower:]')"
@@ -570,8 +621,14 @@ download_image() {
   rand="$(printf '%04x%04x' "${RANDOM}" "${RANDOM}")"
   dest="${WALLPAPER_DIR}/wp-${prefix}-${stamp}-${rand}.${ext_lc}"
   tmp="${dest}.part"
-  curl -fsSL --max-time 120 "${image_url}" -o "${tmp}"
-  if ! accepts_dims "${tmp}"; then
+  rm -f "${tmp}"
+  # Fail closed on HTTP errors, oversized Content-Length, and cleartext redirects.
+  if ! curl_https -fsSL --max-time 120 --max-filesize "${MAX_DOWNLOAD_BYTES}" \
+      "${image_url}" -o "${tmp}"; then
+    rm -f "${tmp}"
+    return 1
+  fi
+  if [[ ! -f "${tmp}" ]] || ! validate_downloaded_image "${tmp}"; then
     rm -f "${tmp}"
     return 1
   fi
