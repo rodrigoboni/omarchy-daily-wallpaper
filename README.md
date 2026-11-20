@@ -85,7 +85,7 @@ File: `~/.config/omarchy/daily-wallpaper/config.json`
 | `apod` | NASA | Astronomy Picture of the Day |
 | `unsplash` | Unsplash | Random landscape photo |
 
-Keys stay only in `config.json` on this machine. They are never written to the fetch log, never returned by IPC `status` (shown as `(set)`), and are passed to curl through a temporary mode-`0600` `--config` file so they do not appear on the process command line.
+Keys stay only in `config.json` on this machine. They are never written to the fetch log, never returned by IPC `status` (shown as `(set)`), and are passed to curl through a temporary mode-`0600` `--config` file so they do not appear on the process command line. URI-encoding also feeds secrets to `jq` on stdin (not `--arg`) so they never land in helper-process argv either.
 
 NASA key: https://api.nasa.gov/  
 Unsplash access key: https://unsplash.com/oauth/applications
@@ -158,7 +158,7 @@ Stdout (single JSON object):
 { "ok": true, "source": "bing", "path": "/…/wp-bing-….jpg", "error": "" }
 ```
 
-`--purge-only` deletes wallpapers older than `keepDays` (minute-accurate `-mmin`) and never removes `--protect` / `status.lastPath`. Still prints JSON (`error` may carry `purged=N`).
+`--purge-only` deletes wallpapers older than `keepDays` (minute-accurate `-mmin`) and never removes `--protect`, `status.lastPath`, or Omarchy’s currently applied background (`~/.local/state/omarchy/current/background`). Still prints JSON (`error` may carry `purged=N`).
 
 Log events (`fetch.log` JSONL): `start`, `attempt`, `reshuffle`, `run`, `purge`. Secrets are never logged.
 

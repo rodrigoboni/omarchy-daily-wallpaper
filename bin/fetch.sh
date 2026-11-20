@@ -156,8 +156,10 @@ fail() {
   exit 0
 }
 
+# URI-encode via jq, feeding the string on stdin so it never appears in jq argv
+# (important for secrets such as NASA_API_KEY).
 uri_encode() {
-  jq -rn --arg s "$1" '$s|@uri'
+  printf '%s' "$1" | jq -rn --raw-input '@uri'
 }
 
 # Run curl with a temporary --config file so secrets never appear in argv.
@@ -535,21 +537,47 @@ apply_wallpaper() {
   fi
 }
 
-# Delete wallpapers older than KEEP_DAYS (minute-accurate). Never remove PROTECT_PATH.
+# Collect absolute paths that must survive retention (plugin lastPath, --protect,
+# and Omarchy's currently applied background if it lives in WALLPAPER_DIR).
+protect_paths() {
+  local -a paths=()
+  local p
+  if [[ -n "${PROTECT_PATH}" ]]; then
+    paths+=("${PROTECT_PATH}")
+  fi
+  if [[ -f "${STATE_DIR}/status.json" ]]; then
+    p="$(jq -r '.lastPath // empty' "${STATE_DIR}/status.json" 2>/dev/null || true)"
+    [[ -n "${p}" ]] && paths+=("${p}")
+  fi
+  # Omarchy points ~/.local/state/omarchy/current/background at the active file.
+  # An older download may still be selected via the background switcher.
+  p="$(readlink -f "${HOME}/.local/state/omarchy/current/background" 2>/dev/null || true)"
+  [[ -n "${p}" ]] && paths+=("${p}")
+
+  local -A seen=()
+  for p in "${paths[@]}"; do
+    p="$(readlink -f "${p}" 2>/dev/null || echo "${p}")"
+    [[ -n "${p}" ]] || continue
+    [[ -n "${seen[$p]+x}" ]] && continue
+    seen["${p}"]=1
+    printf '%s\n' "${p}"
+  done
+}
+
+# Delete wallpapers older than KEEP_DAYS (minute-accurate). Never remove protected paths.
 prune_old() {
-  local mins protect="" removed=0
+  local mins removed=0
+  local -A protect=()
+  local p f abs
   mins=$((KEEP_DAYS * 24 * 60))
   ((mins < 1)) && mins=1
-  if [[ -n "${PROTECT_PATH}" ]]; then
-    protect="$(readlink -f "${PROTECT_PATH}" 2>/dev/null || echo "${PROTECT_PATH}")"
-  elif [[ -f "${STATE_DIR}/status.json" ]]; then
-    protect="$(jq -r '.lastPath // empty' "${STATE_DIR}/status.json" 2>/dev/null || true)"
-    [[ -n "${protect}" ]] && protect="$(readlink -f "${protect}" 2>/dev/null || echo "${protect}")"
-  fi
-  local f abs
+  while IFS= read -r p; do
+    [[ -n "${p}" ]] && protect["${p}"]=1
+  done < <(protect_paths)
+
   while IFS= read -r -d '' f; do
     abs="$(readlink -f "${f}" 2>/dev/null || echo "${f}")"
-    if [[ -n "${protect}" && "${abs}" == "${protect}" ]]; then
+    if [[ -n "${protect[$abs]+x}" ]]; then
       continue
     fi
     rm -f "${f}" && ((++removed)) || true
