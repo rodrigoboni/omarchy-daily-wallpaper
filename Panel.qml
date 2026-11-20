@@ -243,6 +243,16 @@ Panel {
       property alias logBtn: logBtn
       property alias enabledToggle: enabledToggle
 
+      // PanelKeyCatcher uses Keys.BeforeItem and steals hjkl/space/etc.
+      // Block it while any TextField is focused so typing works.
+      blocked: wallpaperDirField.activeFocus
+        || keywordsField.activeFocus
+        || metQueryField.activeFocus
+        || unsplashQueryField.activeFocus
+        || nasaKeyField.activeFocus
+        || unsplashKeyField.activeFocus
+        || bingMktField.activeFocus
+
       implicitHeight: column.implicitHeight
       anchors.fill: parent
       onMoveRequested: function(dx, dy) {
@@ -454,13 +464,17 @@ Panel {
             }
 
             TextField {
+              id: wallpaperDirField
               width: parent.width
-              text: String(root.cfg.wallpaperDir || "")
               foreground: root.foreground
               hasCursor: root.cursorActive && root.focusIndex === 6
               onEditingFinished: root.patchConfig({ wallpaperDir: text.trim() })
               onHoveredChanged: {
                 if (hovered) { root.cursorActive = true; root.focusIndex = 6 }
+              }
+              Binding on text {
+                value: String(root.cfg.wallpaperDir || "")
+                when: !wallpaperDirField.activeFocus
               }
             }
           }
@@ -501,13 +515,17 @@ Panel {
             }
 
             TextField {
+              id: keywordsField
               width: parent.width
-              text: String(root.cfg.keywords || "")
               foreground: root.foreground
               hasCursor: root.cursorActive && root.focusIndex === 8
               onEditingFinished: root.patchConfig({ keywords: text.trim() })
               onHoveredChanged: {
                 if (hovered) { root.cursorActive = true; root.focusIndex = 8 }
+              }
+              Binding on text {
+                value: String(root.cfg.keywords || "")
+                when: !keywordsField.activeFocus
               }
             }
           }
@@ -525,14 +543,18 @@ Panel {
             }
 
             TextField {
+              id: metQueryField
               width: parent.width
-              text: String(root.cfg.metQuery || "")
               placeholderText: String(root.cfg.keywords || "").split(",")[0] || "landscape"
               foreground: root.foreground
               hasCursor: root.cursorActive && root.focusIndex === 9
               onEditingFinished: root.patchConfig({ metQuery: text.trim() })
               onHoveredChanged: {
                 if (hovered) { root.cursorActive = true; root.focusIndex = 9 }
+              }
+              Binding on text {
+                value: String(root.cfg.metQuery || "")
+                when: !metQueryField.activeFocus
               }
             }
           }
@@ -550,14 +572,18 @@ Panel {
             }
 
             TextField {
+              id: unsplashQueryField
               width: parent.width
-              text: String(root.cfg.unsplashQuery || "")
               placeholderText: String(root.cfg.keywords || "").split(",")[0] || "landscape"
               foreground: root.foreground
               hasCursor: root.cursorActive && root.focusIndex === 10
               onEditingFinished: root.patchConfig({ unsplashQuery: text.trim() })
               onHoveredChanged: {
                 if (hovered) { root.cursorActive = true; root.focusIndex = 10 }
+              }
+              Binding on text {
+                value: String(root.cfg.unsplashQuery || "")
+                when: !unsplashQueryField.activeFocus
               }
             }
           }
@@ -638,14 +664,18 @@ Panel {
             }
 
             TextField {
+              id: nasaKeyField
               width: parent.width
-              text: String(root.cfg.nasaApiKey || "")
               password: true
               foreground: root.foreground
               hasCursor: root.cursorActive && root.focusIndex === 15
               onEditingFinished: root.patchConfig({ nasaApiKey: text.trim() })
               onHoveredChanged: {
                 if (hovered) { root.cursorActive = true; root.focusIndex = 15 }
+              }
+              Binding on text {
+                value: String(root.cfg.nasaApiKey || "")
+                when: !nasaKeyField.activeFocus
               }
             }
           }
@@ -663,11 +693,15 @@ Panel {
             }
 
             TextField {
+              id: unsplashKeyField
               width: parent.width
-              text: String(root.cfg.unsplashAccessKey || "")
               password: true
               foreground: root.foreground
               onEditingFinished: root.patchConfig({ unsplashAccessKey: text.trim() })
+              Binding on text {
+                value: String(root.cfg.unsplashAccessKey || "")
+                when: !unsplashKeyField.activeFocus
+              }
             }
           }
 
@@ -684,10 +718,14 @@ Panel {
             }
 
             TextField {
+              id: bingMktField
               width: parent.width
-              text: String(root.cfg.bingMkt || "en-US")
               foreground: root.foreground
               onEditingFinished: root.patchConfig({ bingMkt: text.trim() || "en-US" })
+              Binding on text {
+                value: String(root.cfg.bingMkt || "en-US")
+                when: !bingMktField.activeFocus
+              }
             }
           }
         }
