@@ -1,7 +1,6 @@
 import QtQuick
 import QtQuick.Controls
 import Quickshell
-import Quickshell.Io
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
@@ -35,24 +34,13 @@ Panel {
   readonly property bool rotationEnabled: service ? service.enabled : true
   readonly property string lastSource: service ? String(service.lastSource || "") : ""
   readonly property string lastError: service ? String(service.lastError || "") : ""
+  readonly property string lastSuccessAt: service ? String(service.lastSuccessAt || "") : ""
+  readonly property string lastRunAt: service ? String(service.lastRunAt || "") : ""
   readonly property string nextRunAt: service ? String(service.nextRunAt || "") : ""
+  readonly property string skipReason: service ? String(service.skipReason || "") : ""
+  readonly property string lastResult: service ? String(service.lastResult || "") : ""
+  readonly property int retryCount: service ? Number(service.retryCount || 0) : 0
   readonly property string logPath: Quickshell.env("HOME") + "/.local/state/omarchy/daily-wallpaper/fetch.log"
-  property var localAttempts: []
-  readonly property var recentAttempts: {
-    if (service && service.recentAttempts && service.recentAttempts.length)
-      return service.recentAttempts
-    return localAttempts
-  }
-
-  FileView {
-    id: panelLogFile
-    path: root.logPath
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: root.localAttempts = Config.parseRecentAttempts(text(), 8)
-    onLoadFailed: root.localAttempts = []
-  }
 
   readonly property var sourceOptions: [
     { value: "bing", label: strings.t("source.bing") },
@@ -65,6 +53,7 @@ Panel {
   readonly property string heroMeta: {
     if (busy) return strings.t("busy")
     if (!rotationEnabled) return strings.t("disabled")
+    if (skipReason !== "") return skipReasonLabel(skipReason)
     if (lastSource !== "") return strings.t("lastSource").arg(sourceLabel(lastSource))
     if (lastError !== "") return strings.t("error").arg(lastError)
     return strings.t("neverRun")
@@ -80,10 +69,48 @@ Panel {
     return strings.t("nextIn").arg(strings.tn("hours", hours).arg(Commons.I18n.formatNumber(hours)))
   }
 
+  readonly property string statusResultLine: {
+    if (busy) return strings.t("statusRunning")
+    if (lastResult === "success") return strings.t("statusSuccess")
+    if (lastResult === "failure") return strings.t("statusFailure")
+    if (lastResult === "skipped") return strings.t("statusSkipped")
+    if (lastSuccessAt !== "") return strings.t("statusSuccess")
+    if (lastError !== "") return strings.t("statusFailure")
+    return strings.t("statusUnknown")
+  }
+
+  readonly property string statusSourceLine: {
+    if (lastSource === "") return strings.t("statusNoSource")
+    return strings.t("statusSource").arg(sourceLabel(lastSource))
+  }
+
+  readonly property string statusWhenLine: {
+    var iso = lastSuccessAt || lastRunAt
+    var local = Config.formatLocalDateTime(iso)
+    if (local === "") return strings.t("statusNeverChanged")
+    if (lastSuccessAt !== "") return strings.t("statusChangedAt").arg(local)
+    return strings.t("statusRanAt").arg(local)
+  }
+
+  readonly property string statusExtraLine: {
+    if (retryCount > 0)
+      return strings.t("statusRetry").arg(Commons.I18n.formatNumber(retryCount)).arg(Commons.I18n.formatNumber(Config.RETRY_MAX))
+    if (skipReason !== "") return skipReasonLabel(skipReason)
+    if (lastResult === "failure" && lastError !== "") return strings.t("error").arg(lastError)
+    return ""
+  }
+
   function sourceLabel(id) {
     var key = "source." + id
     var label = strings.t(key)
     return label === key ? id : label
+  }
+
+  function skipReasonLabel(reason) {
+    if (reason === "display_off") return strings.t("skipDisplayOff")
+    if (reason === "sleeping") return strings.t("skipSleeping")
+    if (reason === "battery") return strings.t("skipBattery")
+    return strings.t("skipOther").arg(reason || "?")
   }
 
   function open() {
@@ -151,20 +178,7 @@ Panel {
     if (service && service.toggleEnabled) service.toggleEnabled()
   }
 
-  function formatAttempt(entry) {
-    if (!entry) return ""
-    if (entry.event === "start") return strings.t("attemptStart")
-    if (entry.event === "reshuffle") return strings.t("attemptReshuffle")
-    if (entry.event === "run") {
-      if (entry.ok) return strings.t("attemptRunOk").arg(sourceLabel(entry.source || "?"))
-      return strings.t("attemptRunFail").arg(entry.error || "?")
-    }
-    var src = sourceLabel(entry.source || "?")
-    if (entry.ok) return strings.t("attemptOk").arg(src)
-    return strings.t("attemptFail").arg(src).arg(entry.error || "failed")
-  }
-
-  readonly property int controlCount: 15
+  readonly property int controlCount: 16
 
   function moveFocus(dy) {
     if (!cursorActive) {
@@ -206,7 +220,6 @@ Panel {
     cursorActive = false
     focusIndex = 0
     if (service && service.refreshLog) service.refreshLog()
-    panelLogFile.reload()
     if (panel.loadedContent && panel.loadedContent.panelFlick)
       panel.loadedContent.panelFlick.contentY = 0
     Qt.callLater(function() { if (panel.loadedContent) panel.loadedContent.forceActiveFocus() })
@@ -325,7 +338,7 @@ Panel {
 
             PanelSectionHeader {
               width: parent.width
-              text: strings.t("lastAttempts")
+              text: strings.t("statusSection")
               foreground: root.foreground
             }
 
@@ -333,38 +346,52 @@ Panel {
               width: parent.width
               textFormat: Text.PlainText
               wrapMode: Text.WordWrap
-              text: root.logPath
-              color: Qt.darker(root.dim, 1.05)
+              text: root.statusResultLine
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              text: root.statusSourceLine
+              color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
             }
 
             Text {
               width: parent.width
-              visible: root.recentAttempts.length === 0
               textFormat: Text.PlainText
               wrapMode: Text.WordWrap
-              text: strings.t("noAttempts")
+              text: root.statusWhenLine
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
             }
 
-            Repeater {
-              model: root.recentAttempts
-              delegate: Text {
-                width: parent.width
-                textFormat: Text.PlainText
-                wrapMode: Text.WordWrap
-                elide: Text.ElideRight
-                maximumLineCount: 2
-                text: root.formatAttempt(modelData)
-                color: modelData && modelData.ok === false && modelData.event === "attempt"
-                  ? Qt.darker(root.foreground, 1.15)
-                  : root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
+            Text {
+              width: parent.width
+              visible: root.nextLabel !== ""
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              text: root.nextLabel
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              width: parent.width
+              visible: root.statusExtraLine !== ""
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              text: root.statusExtraLine
+              color: Qt.darker(root.foreground, 1.1)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
             }
           }
 
@@ -573,6 +600,19 @@ Panel {
             }
           }
 
+          Toggle {
+            width: parent.width
+            label: strings.t("pauseOnBattery")
+            description: strings.t("pauseOnBatteryHint")
+            checked: root.cfg.pauseOnBattery === true
+            foreground: root.foreground
+            hasCursor: root.cursorActive && root.focusIndex === 14
+            onClicked: root.patchConfig({ pauseOnBattery: !(root.cfg.pauseOnBattery === true) })
+            onHovered: function(on) {
+              if (on) { root.cursorActive = true; root.focusIndex = 14 }
+            }
+          }
+
           PanelSeparator { width: parent.width }
 
           Text {
@@ -602,10 +642,10 @@ Panel {
               text: String(root.cfg.nasaApiKey || "")
               password: true
               foreground: root.foreground
-              hasCursor: root.cursorActive && root.focusIndex === 14
+              hasCursor: root.cursorActive && root.focusIndex === 15
               onEditingFinished: root.patchConfig({ nasaApiKey: text.trim() })
               onHoveredChanged: {
-                if (hovered) { root.cursorActive = true; root.focusIndex = 14 }
+                if (hovered) { root.cursorActive = true; root.focusIndex = 15 }
               }
             }
           }

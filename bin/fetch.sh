@@ -6,13 +6,16 @@
 # Usage:
 #   fetch.sh --config ~/.config/omarchy/daily-wallpaper/config.json \
 #            [--min-width N] [--min-height N]
-# Prints one JSON object to stdout on completion / failure.
+#   fetch.sh --config ... --purge-only
+# Prints one JSON object to stdout on completion / failure / purge-only.
 
 set -euo pipefail
 
 CONFIG_PATH=""
 MIN_WIDTH_OVERRIDE=""
 MIN_HEIGHT_OVERRIDE=""
+PURGE_ONLY="0"
+PROTECT_PATH=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -26,6 +29,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --min-height)
       MIN_HEIGHT_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --purge-only)
+      PURGE_ONLY="1"
+      shift
+      ;;
+    --protect)
+      PROTECT_PATH="${2:-}"
       shift 2
       ;;
     *)
@@ -147,6 +158,21 @@ fail() {
 
 uri_encode() {
   jq -rn --arg s "$1" '$s|@uri'
+}
+
+# Run curl with a temporary --config file so secrets never appear in argv.
+# Usage: curl_with_config <max-time> <config-body> [extra curl args...]
+# Config body is written to a 0600 temp file and passed via -K only.
+curl_with_config() {
+  local max_time="$1" body="$2"
+  shift 2
+  local cfg ec=0
+  cfg="$(mktemp "${TMPDIR:-/tmp}/dw-curl.XXXXXX")"
+  chmod 600 "${cfg}"
+  printf '%s\n' "${body}" >"${cfg}"
+  curl -fsSL --max-time "${max_time}" -K "${cfg}" "$@" || ec=$?
+  rm -f "${cfg}"
+  return "${ec}"
 }
 
 _normalize_int() {
@@ -276,8 +302,11 @@ try_source_bing() {
 
 try_source_apod() {
   _nasa_key_ok || return 1
-  local json url media
-  json="$(curl -fsSL --max-time 30 "https://api.nasa.gov/planetary/apod?api_key=${NASA_API_KEY}&thumbs=true")" || return 1
+  local json url media key_enc cfg_body
+  # Keep api_key out of curl argv — only inside a 0600 -K config file.
+  key_enc="$(uri_encode "${NASA_API_KEY}")"
+  cfg_body="$(printf 'url = "https://api.nasa.gov/planetary/apod?api_key=%s&thumbs=true"' "${key_enc}")"
+  json="$(curl_with_config 30 "${cfg_body}")" || return 1
   media="$(jq -r '.media_type // "image"' <<< "${json}")"
   if [[ "${media}" == "image" ]]; then
     url="$(jq -r '(.hdurl // .url) // empty' <<< "${json}")"
@@ -384,10 +413,11 @@ try_source_met() {
 
 try_source_unsplash() {
   [[ -n "${UNSPLASH_ACCESS_KEY}" ]] || return 1
-  local json url qenc
+  local json url qenc cfg_body
   qenc="$(uri_encode "${UNSPLASH_QUERY}")"
-  json="$(curl -fsSL --max-time 30 \
-    -H "Authorization: Client-ID ${UNSPLASH_ACCESS_KEY}" \
+  # Keep Client-ID out of curl argv — only inside a 0600 -K config file.
+  cfg_body="$(printf 'header = "Authorization: Client-ID %s"' "${UNSPLASH_ACCESS_KEY}")"
+  json="$(curl_with_config 30 "${cfg_body}" \
     "https://api.unsplash.com/photos/random?orientation=landscape&content_filter=high&query=${qenc}")" || return 1
   url="$(jq -r '.urls.raw // .urls.full // .urls.regular // empty' <<< "${json}")"
   [[ -n "${url}" && "${url}" != "null" ]] || return 1
@@ -505,10 +535,29 @@ apply_wallpaper() {
   fi
 }
 
+# Delete wallpapers older than KEEP_DAYS (minute-accurate). Never remove PROTECT_PATH.
 prune_old() {
-  find "${WALLPAPER_DIR}" -maxdepth 1 -type f \
+  local mins protect="" removed=0
+  mins=$((KEEP_DAYS * 24 * 60))
+  ((mins < 1)) && mins=1
+  if [[ -n "${PROTECT_PATH}" ]]; then
+    protect="$(readlink -f "${PROTECT_PATH}" 2>/dev/null || echo "${PROTECT_PATH}")"
+  elif [[ -f "${STATE_DIR}/status.json" ]]; then
+    protect="$(jq -r '.lastPath // empty' "${STATE_DIR}/status.json" 2>/dev/null || true)"
+    [[ -n "${protect}" ]] && protect="$(readlink -f "${protect}" 2>/dev/null || echo "${protect}")"
+  fi
+  local f abs
+  while IFS= read -r -d '' f; do
+    abs="$(readlink -f "${f}" 2>/dev/null || echo "${f}")"
+    if [[ -n "${protect}" && "${abs}" == "${protect}" ]]; then
+      continue
+    fi
+    rm -f "${f}" && ((++removed)) || true
+  done < <(find "${WALLPAPER_DIR}" -maxdepth 1 -type f \
     \( -name 'wp-*' -o -name 'bing-*' \) \
-    -mtime "+${KEEP_DAYS}" -delete 2>/dev/null || true
+    -mmin "+${mins}" -print0 2>/dev/null)
+  log_event "purge" "" 1 "removed=${removed} keepDays=${KEEP_DAYS}" ""
+  echo "${removed}"
 }
 
 # Sets DECK_IDX / DECK_SRC / DECK_DEST / DECK_REM on success.
@@ -541,8 +590,18 @@ try_deck() {
 }
 
 main() {
-  local remaining_json n new_rem
+  local remaining_json n new_rem removed
+
+  if [[ "${PURGE_ONLY}" == "1" ]]; then
+    removed="$(prune_old)"
+    emit 1 "" "" "purged=${removed}"
+    exit 0
+  fi
+
   log_event "start" "" 1 "" ""
+  # Retention even when fetches fail later in this run.
+  prune_old >/dev/null || true
+
   remaining_json="$(queue_load_remaining)"
   n="$(jq 'length' <<< "${remaining_json}")"
   if ((n == 0)); then
@@ -561,7 +620,8 @@ main() {
   fi
 
   apply_wallpaper "${DECK_DEST}"
-  prune_old
+  PROTECT_PATH="${DECK_DEST}"
+  prune_old >/dev/null || true
   new_rem="$(jq -c --argjson i "${DECK_IDX}" 'del(.[$i])' <<< "${DECK_REM}")"
   queue_save_remaining "${new_rem}"
   log_event "run" "${DECK_SRC}" 1 "" "${DECK_DEST}"

@@ -12,12 +12,16 @@ var DEFAULT_CONFIG = {
   matchResolution: true,
   applyToLockScreen: true,
   notifyOnChange: true,
+  pauseOnBattery: false,
   nasaApiKey: "",
   unsplashAccessKey: "",
   bingMkt: "en-US"
 }
 
 var SOURCE_IDS = ["bing", "apod", "met", "nasa_images", "unsplash"]
+
+var RETRY_BACKOFF_MINUTES = [5, 15, 30]
+var RETRY_MAX = 3
 
 function defaultWallpaperDir(home) {
   return String(home || "") + "/Pictures/daily-wallpapers"
@@ -35,6 +39,7 @@ function mergeConfig(raw, home) {
   cfg.matchResolution = cfg.matchResolution !== false
   cfg.applyToLockScreen = cfg.applyToLockScreen !== false
   cfg.notifyOnChange = cfg.notifyOnChange !== false
+  cfg.pauseOnBattery = cfg.pauseOnBattery === true
 
   var hours = parseInt(String(cfg.intervalHours), 10)
   if (!isFinite(hours) || hours < 1) hours = 24
@@ -84,13 +89,7 @@ function serializeConfig(cfg) {
   return JSON.stringify(cfg, null, 2) + "\n"
 }
 
-function parseStatusText(text) {
-  try {
-    if (text && String(text).trim() !== "") {
-      var obj = JSON.parse(text)
-      if (obj && typeof obj === "object") return obj
-    }
-  } catch (e) {}
+function emptyStatus() {
   return {
     busy: false,
     lastRunAt: "",
@@ -98,8 +97,30 @@ function parseStatusText(text) {
     lastSource: "",
     lastPath: "",
     lastError: "",
-    nextRunAt: ""
+    nextRunAt: "",
+    skipReason: "",
+    retryCount: 0,
+    lastResult: ""
   }
+}
+
+function parseStatusText(text) {
+  try {
+    if (text && String(text).trim() !== "") {
+      var obj = JSON.parse(text)
+      if (obj && typeof obj === "object") {
+        var base = emptyStatus()
+        for (var k in base) {
+          if (Object.prototype.hasOwnProperty.call(obj, k)) base[k] = obj[k]
+        }
+        var rc = parseInt(String(base.retryCount), 10)
+        base.retryCount = isFinite(rc) && rc > 0 ? rc : 0
+        base.busy = base.busy === true
+        return base
+      }
+    }
+  } catch (e) {}
+  return emptyStatus()
 }
 
 function expandHome(path, home) {
@@ -108,6 +129,20 @@ function expandHome(path, home) {
   if (p.indexOf("~/") === 0) return h + p.slice(1)
   if (p === "~") return h
   return p
+}
+
+function formatLocalDateTime(iso) {
+  var ms = Date.parse(String(iso || ""))
+  if (!isFinite(ms) || ms <= 0) return ""
+  var d = new Date(ms)
+  function pad(n) { return n < 10 ? "0" + n : String(n) }
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+    + " " + pad(d.getHours()) + ":" + pad(d.getMinutes())
+}
+
+function retryBackoffMs(retryCount) {
+  var idx = Math.max(0, Math.min(RETRY_BACKOFF_MINUTES.length - 1, (retryCount || 1) - 1))
+  return RETRY_BACKOFF_MINUTES[idx] * 60 * 1000
 }
 
 // Newest-first list of attempt/run events from fetch.log (JSONL).
@@ -123,7 +158,7 @@ function parseRecentAttempts(text, limit) {
       var obj = JSON.parse(line)
       if (!obj || typeof obj !== "object") continue
       var event = String(obj.event || "")
-      if (event !== "attempt" && event !== "run" && event !== "reshuffle" && event !== "start") continue
+      if (event !== "attempt" && event !== "run" && event !== "reshuffle" && event !== "start" && event !== "purge") continue
       out.push({
         ts: String(obj.ts || ""),
         event: event,
@@ -141,6 +176,7 @@ function attemptSummaryLine(entry) {
   if (!entry) return ""
   if (entry.event === "start") return "run started"
   if (entry.event === "reshuffle") return "deck reshuffled"
+  if (entry.event === "purge") return "purged · " + (entry.error || "")
   if (entry.event === "run") {
     if (entry.ok) return "run ok · " + (entry.source || "?")
     return "run failed · " + (entry.error || "error")

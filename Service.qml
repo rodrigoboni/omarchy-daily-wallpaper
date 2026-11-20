@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Services.UPower
 import qs.Commons
 import "Config.js" as Config
 
@@ -30,14 +31,25 @@ Item {
   property var recentAttempts: []
   property bool configReady: false
   property bool fetchQueued: false
+  property bool forceFetch: false
+  property bool deferredDue: false
+  property bool sleeping: false
+  property bool displayAwake: true
+  property int prevKeepDays: -1
 
   readonly property bool enabled: config.enabled === true
-  readonly property bool busy: status.busy === true || fetchProc.running
+  readonly property bool busy: status.busy === true || fetchProc.running || monitorsProc.running || gateMonitorsProc.running
   readonly property string lastSource: String(status.lastSource || "")
   readonly property string lastPath: String(status.lastPath || "")
   readonly property string lastError: String(status.lastError || "")
   readonly property string lastSuccessAt: String(status.lastSuccessAt || "")
+  readonly property string lastRunAt: String(status.lastRunAt || "")
   readonly property string nextRunAt: String(status.nextRunAt || "")
+  readonly property string skipReason: String(status.skipReason || "")
+  readonly property string lastResult: String(status.lastResult || "")
+  readonly property int retryCount: Number(status.retryCount || 0)
+  readonly property bool onBattery: UPower.onBattery === true
+  readonly property bool pauseOnBattery: config.pauseOnBattery === true
 
   function refreshLog() {
     logFile.reload()
@@ -64,8 +76,11 @@ Item {
   }
 
   function saveConfig(nextCfg) {
+    var prevKeep = Number(config.keepDays || 7)
     config = Config.mergeConfig(nextCfg, home)
     configFile.setText(Config.serializeConfig(config))
+    if (Number(config.keepDays) !== prevKeep)
+      Qt.callLater(runPurgeOnly)
     scheduleNext()
   }
 
@@ -99,26 +114,74 @@ Item {
     }
   }
 
+  function parseDisplayAwake(raw) {
+    try {
+      var monitors = JSON.parse(String(raw || "").trim() || "[]")
+      if (!monitors || typeof monitors.length !== "number" || monitors.length === 0)
+        return true
+      for (var i = 0; i < monitors.length; i++) {
+        var m = monitors[i]
+        if (m && m.disabled !== true && m.dpmsStatus !== false)
+          return true
+      }
+      return false
+    } catch (e) {
+      return true
+    }
+  }
+
+  function scheduledBlockedReason() {
+    if (sleeping) return "sleeping"
+    if (!displayAwake) return "display_off"
+    if (pauseOnBattery && onBattery) return "battery"
+    return ""
+  }
+
+  function deferScheduled(reason) {
+    deferredDue = true
+    writeStatus({
+      skipReason: reason,
+      busy: false,
+      lastResult: "skipped"
+    })
+    if (!deferPollTimer.running) {
+      deferPollTimer.interval = 60000
+      deferPollTimer.restart()
+    }
+  }
+
+  function clearDeferral() {
+    deferredDue = false
+    if (status.skipReason)
+      writeStatus({ skipReason: "" })
+  }
+
   // afterRun: schedule a full interval from now (used after a completed fetch).
-  // Otherwise honor lastSuccessAt + interval, or a short first-run delay.
-  function scheduleNext(afterRun) {
+  // retryBackoff: use bounded retry delays instead of intervalHours.
+  function scheduleNext(afterRun, retryBackoff) {
     if (!enabled) {
       scheduleTimer.stop()
-      writeStatus({ nextRunAt: "", busy: busy })
+      writeStatus({ nextRunAt: "", busy: busy, skipReason: "" })
       return
     }
-    var intervalMs = Math.max(1, Number(config.intervalHours) || 24) * 3600 * 1000
-    var last = Date.parse(String(status.lastSuccessAt || ""))
-    var nextMs
-    if (afterRun === true) {
-      nextMs = Date.now() + intervalMs
-    } else if (isFinite(last) && last > 0) {
-      nextMs = last + intervalMs
-      if (nextMs <= Date.now() + 1000) nextMs = Date.now() + intervalMs
+    var delay
+    if (retryBackoff === true) {
+      var count = Math.max(1, Number(status.retryCount || 1))
+      delay = Config.retryBackoffMs(count)
     } else {
-      nextMs = Date.now() + 15000
+      var intervalMs = Math.max(1, Number(config.intervalHours) || 24) * 3600 * 1000
+      var last = Date.parse(String(status.lastSuccessAt || ""))
+      var nextMs
+      if (afterRun === true) {
+        nextMs = Date.now() + intervalMs
+      } else if (isFinite(last) && last > 0) {
+        nextMs = last + intervalMs
+        if (nextMs <= Date.now() + 1000) nextMs = Date.now() + intervalMs
+      } else {
+        nextMs = Date.now() + 15000
+      }
+      delay = Math.max(5000, nextMs - Date.now())
     }
-    var delay = Math.max(5000, nextMs - Date.now())
     // QML Timer interval is 32-bit; cap near 24 days.
     if (delay > 2147483647) delay = 2147483647
     scheduleTimer.interval = delay
@@ -127,21 +190,55 @@ Item {
   }
 
   function changeNow() {
-    if (fetchProc.running || monitorsProc.running) {
+    forceFetch = true
+    clearDeferral()
+    // If a fetch is already downloading, queue a follow-up forced run.
+    // If only preflight (DPMS/monitors) is running, upgrade that run to forced
+    // instead of scheduling a duplicate.
+    if (fetchProc.running) {
       fetchQueued = true
       return
     }
-    runFetch()
+    if (monitorsProc.running || gateMonitorsProc.running)
+      return
+    runFetch(true)
   }
 
-  function runFetch() {
+  function runFetch(force) {
+    forceFetch = force === true
     if (sourceDir === "" || fetchScript === "/bin/fetch.sh") {
       writeStatus({
         busy: false,
         lastRunAt: new Date().toISOString(),
-        lastError: "plugin source directory unavailable"
+        lastError: "plugin source directory unavailable",
+        lastResult: "failure"
       })
       return
+    }
+    if (!forceFetch) {
+      var blocked = scheduledBlockedReason()
+      if (blocked) {
+        deferScheduled(blocked)
+        return
+      }
+      // Re-check DPMS right before starting (may have changed since last poll).
+      if (!gateMonitorsProc.running && !monitorsProc.running && !fetchProc.running) {
+        gateMonitorsProc.running = true
+        return
+      }
+    }
+    scheduleTimer.stop()
+    ensureDirs()
+    monitorsProc.running = true
+  }
+
+  function continueAfterGateCheck() {
+    if (!forceFetch) {
+      var blocked = scheduledBlockedReason()
+      if (blocked) {
+        deferScheduled(blocked)
+        return
+      }
     }
     scheduleTimer.stop()
     ensureDirs()
@@ -153,18 +250,37 @@ Item {
     writeStatus({
       busy: true,
       lastRunAt: new Date().toISOString(),
-      lastError: ""
+      lastError: "",
+      skipReason: "",
+      lastResult: "running"
     })
+    clearDeferral()
     fetchProc.command = [
       "bash", fetchScript,
       "--config", configPath,
       "--min-width", String(mins.width || 0),
-      "--min-height", String(mins.height || 0)
+      "--min-height", String(mins.height || 0),
+      "--protect", String(status.lastPath || "")
     ]
     fetchProc.running = true
   }
 
+  function runPurgeOnly() {
+    if (sourceDir === "" || fetchScript === "/bin/fetch.sh") return
+    if (purgeProc.running) return
+    ensureDirs()
+    purgeProc.command = [
+      "bash", fetchScript,
+      "--config", configPath,
+      "--purge-only",
+      "--protect", String(status.lastPath || "")
+    ]
+    purgeProc.running = true
+  }
+
   function handleFetchResult(raw, exitCode) {
+    var wasForced = forceFetch
+    forceFetch = false
     var result = { ok: false, source: "", path: "", error: "" }
     try {
       var parsed = JSON.parse(String(raw || "").trim().split("\n").pop() || "{}")
@@ -178,12 +294,16 @@ Item {
     var patch = {
       busy: false,
       lastRunAt: new Date().toISOString(),
-      lastError: result.ok ? "" : String(result.error || "fetch failed")
+      lastError: result.ok ? "" : String(result.error || "fetch failed"),
+      skipReason: ""
     }
+
     if (result.ok) {
       patch.lastSuccessAt = patch.lastRunAt
       patch.lastSource = String(result.source || "")
       patch.lastPath = String(result.path || "")
+      patch.lastResult = "success"
+      patch.retryCount = 0
       if (config.notifyOnChange) {
         var label = patch.lastSource || "wallpaper"
         Quickshell.execDetached([
@@ -192,13 +312,31 @@ Item {
           "Source: " + label
         ])
       }
+      writeStatus(patch)
+      scheduleNext(true, false)
+    } else {
+      patch.lastResult = "failure"
+      var err = String(result.error || "")
+      var allFailed = err.indexOf("all sources failed") >= 0
+          || err.indexOf("no eligible sources") >= 0
+      var nextRetry = allFailed ? Number(status.retryCount || 0) + 1 : 0
+      if (allFailed && nextRetry <= Config.RETRY_MAX) {
+        patch.retryCount = nextRetry
+        writeStatus(patch)
+        scheduleNext(true, true)
+      } else {
+        patch.retryCount = 0
+        writeStatus(patch)
+        scheduleNext(true, false)
+      }
     }
-    writeStatus(patch)
-    scheduleNext(true)
+
     Qt.callLater(refreshLog)
     if (fetchQueued) {
       fetchQueued = false
-      Qt.callLater(runFetch)
+      Qt.callLater(function() { root.runFetch(true) })
+    } else if (wasForced) {
+      // forced run finished; nothing else
     }
   }
 
@@ -222,6 +360,28 @@ Item {
     updateConfig({ enabled: !enabled })
   }
 
+  function tryFlushDeferred() {
+    if (!enabled || busy || sleeping) return
+    var blocked = scheduledBlockedReason()
+    if (blocked) {
+      deferScheduled(blocked)
+      return
+    }
+    if (deferredDue) {
+      clearDeferral()
+      runFetch(false)
+      return
+    }
+    var next = Date.parse(String(nextRunAt || ""))
+    if (!isFinite(next) || next <= Date.now())
+      scheduleNext()
+  }
+
+  function requestGateRecheck() {
+    if (!gateCheckPollProc.running)
+      gateCheckPollProc.running = true
+  }
+
   FileView {
     id: configFile
     path: root.configPath
@@ -234,6 +394,9 @@ Item {
       root.config = Config.parseConfigText(text(), root.home)
       root.configReady = true
       root.ensureDirs()
+      if (root.prevKeepDays >= 0 && root.prevKeepDays !== Number(root.config.keepDays))
+        Qt.callLater(root.runPurgeOnly)
+      root.prevKeepDays = Number(root.config.keepDays)
       root.scheduleNext()
     }
     onLoadFailed: {
@@ -241,6 +404,7 @@ Item {
       root.configReady = true
       root.ensureDirs()
       setText(Config.serializeConfig(root.config))
+      root.prevKeepDays = Number(root.config.keepDays)
       root.scheduleNext()
     }
   }
@@ -273,6 +437,20 @@ Item {
     onLoadFailed: root.recentAttempts = []
   }
 
+  // Pre-flight DPMS check for scheduled runs.
+  Process {
+    id: gateMonitorsProc
+    command: ["hyprctl", "monitors", "-j"]
+    stdout: StdioCollector {
+      id: gateMonitorsCollector
+      waitForEnd: true
+    }
+    onExited: function() {
+      root.displayAwake = root.parseDisplayAwake(gateMonitorsCollector.text || "")
+      root.continueAfterGateCheck()
+    }
+  }
+
   Process {
     id: monitorsProc
     command: ["hyprctl", "monitors", "-j"]
@@ -281,6 +459,14 @@ Item {
       waitForEnd: true
     }
     onExited: function() {
+      root.displayAwake = root.parseDisplayAwake(monitorsCollector.text || "")
+      if (!root.forceFetch) {
+        var blocked = root.scheduledBlockedReason()
+        if (blocked) {
+          root.deferScheduled(blocked)
+          return
+        }
+      }
       root.startFetchWithMonitors()
     }
   }
@@ -303,11 +489,85 @@ Item {
     }
   }
 
+  Process {
+    id: purgeProc
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+  }
+
+  // Watch logind PrepareForSleep so we defer across suspend/resume.
+  Process {
+    id: sleepMonitorProc
+    running: true
+    command: [
+      "gdbus", "monitor", "--system",
+      "--dest", "org.freedesktop.login1",
+      "--object-path", "/org/freedesktop/login1"
+    ]
+    stdout: SplitParser {
+      onRead: function(line) {
+        var s = String(line || "")
+        if (s.indexOf("PrepareForSleep") < 0) return
+        if (s.indexOf("true") >= 0) {
+          root.sleeping = true
+          if (root.status.skipReason !== "sleeping")
+            root.writeStatus({ skipReason: "sleeping" })
+        } else if (s.indexOf("false") >= 0) {
+          root.sleeping = false
+          Qt.callLater(root.requestGateRecheck)
+        }
+      }
+    }
+    onExited: function() {
+      // Keep the watch alive across gdbus/logind blips.
+      sleepMonitorRestart.restart()
+    }
+  }
+
+  Timer {
+    id: sleepMonitorRestart
+    interval: 2000
+    repeat: false
+    onTriggered: {
+      if (!sleepMonitorProc.running)
+        sleepMonitorProc.running = true
+    }
+  }
+
   Timer {
     id: scheduleTimer
     repeat: false
     onTriggered: {
-      if (root.enabled) root.runFetch()
+      if (root.enabled) root.runFetch(false)
+    }
+  }
+
+  Timer {
+    id: deferPollTimer
+    repeat: true
+    interval: 60000
+    onTriggered: {
+      if (!root.enabled || root.busy) return
+      if (!root.deferredDue && !root.sleeping && !(root.pauseOnBattery && root.onBattery)) {
+        stop()
+        return
+      }
+      // Refresh DPMS, then try flush.
+      if (!gateCheckPollProc.running)
+        gateCheckPollProc.running = true
+    }
+  }
+
+  Process {
+    id: gateCheckPollProc
+    command: ["hyprctl", "monitors", "-j"]
+    stdout: StdioCollector {
+      id: gateCheckPollCollector
+      waitForEnd: true
+    }
+    onExited: function() {
+      root.displayAwake = root.parseDisplayAwake(gateCheckPollCollector.text || "")
+      root.tryFlushDeferred()
     }
   }
 
@@ -318,8 +578,31 @@ Item {
     repeat: true
     onTriggered: {
       if (!root.enabled || root.busy) return
+      if (root.deferredDue) {
+        root.tryFlushDeferred()
+        return
+      }
       var next = Date.parse(String(root.nextRunAt || ""))
       if (!isFinite(next) || next <= Date.now()) root.scheduleNext()
+    }
+  }
+
+  // Daily retention sweep even if fetches keep failing.
+  Timer {
+    interval: 86400000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.runPurgeOnly()
+  }
+
+  onOnBatteryChanged: {
+    if (!root.enabled || root.busy) return
+    if (root.pauseOnBattery && root.onBattery) {
+      if (!root.forceFetch)
+        root.deferScheduled("battery")
+    } else if (root.deferredDue) {
+      Qt.callLater(root.requestGateRecheck)
     }
   }
 
@@ -354,7 +637,12 @@ Item {
         lastPath: root.lastPath,
         lastError: root.lastError,
         lastSuccessAt: root.lastSuccessAt,
+        lastRunAt: root.lastRunAt,
         nextRunAt: root.nextRunAt,
+        skipReason: root.skipReason,
+        lastResult: root.lastResult,
+        retryCount: root.retryCount,
+        onBattery: root.onBattery,
         config: cfg
       })
     }
@@ -366,6 +654,11 @@ Item {
 
     function openLog(): string {
       root.openLog()
+      return "ok"
+    }
+
+    function purge(): string {
+      root.runPurgeOnly()
       return "ok"
     }
   }
