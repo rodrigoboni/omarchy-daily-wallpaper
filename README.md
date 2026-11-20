@@ -89,8 +89,28 @@ File: `~/.config/omarchy/daily-wallpaper/config.json`
 
 Keys stay only in `config.json` on this machine (directory mode `700`, file mode `600`). They are never written to the fetch log, never returned by IPC `status` (shown as `(set)`), and are passed to curl through a temporary mode-`0600` `--config` file in a fresh owner-only `0700` directory under `$XDG_RUNTIME_DIR` (or private HOME state if unset) — never shared `/tmp`. That directory is refused unless owned by the current user with mode `700`. URI-encoding also feeds secrets to `jq` on stdin (not `--arg`) so they never land in helper-process argv either.
 
-NASA key: https://api.nasa.gov/  
-Unsplash access key: https://unsplash.com/oauth/applications
+### API keys (NASA / Unsplash)
+
+Bing, Met, and NASA Images need no key. Enable **NASA APOD** and/or **Unsplash** in the panel, then paste keys into the matching fields (or set `nasaApiKey` / `unsplashAccessKey` in `config.json`).
+
+#### NASA API key (for APOD)
+
+1. Open [api.nasa.gov](https://api.nasa.gov/).
+2. Fill **Generate API Key** (name, email, optional use description) and submit.
+3. Copy the key from the confirmation page or the email NASA sends.
+4. Paste it into the panel’s **NASA API key** field.
+
+Do **not** use `DEMO_KEY` — the plugin rejects it (shared demo quota is too low for wallpaper rotation).
+
+#### Unsplash access key
+
+1. Create / sign in at [unsplash.com](https://unsplash.com/).
+2. Open [Your applications](https://unsplash.com/oauth/applications) → **New Application**.
+3. Accept the API terms, name the app (e.g. `omarchy-daily-wallpaper`), create it.
+4. Open the app and copy the **Access Key** (not the Secret Key).
+5. Paste it into the panel’s **Unsplash access key** field.
+
+Demo / public “Client-ID” samples from Unsplash docs are not suitable; use a key from your own application. Respect [Unsplash API guidelines](https://help.unsplash.com/en/articles/2511245-unsplash-api-guidelines) (attribution is handled by Unsplash’s terms for API use; don’t hotlink without following their rules).
 
 ## State files
 
