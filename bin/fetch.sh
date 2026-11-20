@@ -162,8 +162,9 @@ fail() {
 
 # URI-encode via jq, feeding the string on stdin so it never appears in jq argv
 # (important for secrets such as NASA_API_KEY).
+# Use -Rr (not -rn): -n ignores stdin and made @uri emit null, breaking queries.
 uri_encode() {
-  printf '%s' "$1" | jq -rn --raw-input '@uri'
+  printf '%s' "$1" | jq -Rr '@uri'
 }
 
 # Ensure dir is a real directory we own with mode 700. Never follow/trust a
@@ -769,15 +770,20 @@ current_wallpaper_path() {
   printf '%s' "${p}"
 }
 
+# Set by download_image: 1 when an existing local file was reused (no new bytes).
+DOWNLOAD_REUSED=0
+
 download_image() {
   local image_url="$1" prefix="$2"
   local base ext ext_lc stamp rand dest tmp url_key canon existing content_hash
+  DOWNLOAD_REUSED=0
   require_https_url "${image_url}" || return 1
   canon="$(canonical_image_url "${image_url}")"
   url_key="$(sha256_text "${canon}")"
 
   if existing="$(index_lookup_url "${url_key}")"; then
     if validate_downloaded_image "${existing}"; then
+      DOWNLOAD_REUSED=1
       echo -n "${existing}"
       return 0
     fi
@@ -810,6 +816,7 @@ download_image() {
   if [[ -n "${content_hash}" ]] && existing="$(index_lookup_hash "${content_hash}")"; then
     rm -f "${tmp}"
     index_remember "${url_key}" "${content_hash}" "${existing}"
+    DOWNLOAD_REUSED=1
     echo -n "${existing}"
     return 0
   fi
@@ -818,6 +825,7 @@ download_image() {
   if [[ -n "${content_hash}" ]]; then
     index_remember "${url_key}" "${content_hash}" "${dest}"
   fi
+  DOWNLOAD_REUSED=0
   echo -n "${dest}"
 }
 
@@ -900,6 +908,12 @@ try_deck() {
     if url="$(try_source_by_name "${src}")"; then
       if dest="$(download_image "${url}" "${src}")"; then
         dest_abs="$(readlink -f "${dest}" 2>/dev/null || echo "${dest}")"
+        # Already on disk from a previous fetch (e.g. Bing's same daily URL) —
+        # skip so we do not keep re-applying the same image.
+        if [[ "${DOWNLOAD_REUSED}" == "1" ]]; then
+          log_event "attempt" "${src}" 0 "already stored (skipped)" "${dest}"
+          continue
+        fi
         # Same file or same bytes as the active wallpaper — try another source.
         if [[ -n "${cur}" && "${dest_abs}" == "${cur}" ]]; then
           log_event "attempt" "${src}" 0 "duplicate of current wallpaper" "${dest}"
