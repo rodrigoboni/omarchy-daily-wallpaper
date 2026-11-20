@@ -53,6 +53,7 @@ Optional bar setting **Show source label** shows the last source next to the ico
 - Apply to desktop and lock screen via Omarchy backgrounds
 - Panel status summary (result, source, time, next run, skip/retry hints); full JSONL via **Open log**
 - HTTPS-only image URLs/redirects; download size and decoded-pixel caps before applying a wallpaper
+- Dedupes stored wallpapers by URL and content hash (no repeated downloads of the same image)
 
 ## Config reference
 
@@ -98,6 +99,7 @@ Unsplash access key: https://unsplash.com/oauth/applications
 | `~/.local/state/omarchy/daily-wallpaper/status.json` | Last / next run, result, skip reason, retry count |
 | `~/.local/state/omarchy/daily-wallpaper/fetch.log` | JSONL attempt / run / purge events |
 | `~/.local/state/omarchy/daily-wallpaper/queue.json` | Remaining shuffled source deck |
+| `~/.local/state/omarchy/daily-wallpaper/image-index.json` | URL / content-hash → local file map for dedupe |
 
 ## Dependencies
 

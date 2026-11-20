@@ -47,6 +47,7 @@ done
 
 STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/omarchy/daily-wallpaper"
 QUEUE_FILE="${STATE_DIR}/queue.json"
+INDEX_FILE="${STATE_DIR}/image-index.json"
 LOG_FILE="${STATE_DIR}/fetch.log"
 LOG_MAX_LINES=400
 WALLPAPER_DIR="${HOME}/Pictures/daily-wallpapers"
@@ -606,11 +607,142 @@ queue_reshuffle() {
   echo "${shuffled}"
 }
 
+sha256_text() {
+  printf '%s' "$1" | sha256sum | awk '{print $1}'
+}
+
+sha256_file() {
+  sha256sum -- "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# Canonicalize provider URLs so ephemeral resize params don't defeat URL dedupe
+# (Unsplash w=/q=, etc.). Path + host still distinguish distinct assets.
+canonical_image_url() {
+  local url="${1%%\?*}"
+  printf '%s' "${url}"
+}
+
+index_load() {
+  if [[ -f "${INDEX_FILE}" ]]; then
+    jq -c 'if type == "object" then . else {} end
+      | {byUrl: (.byUrl // {}), byHash: (.byHash // {})}' "${INDEX_FILE}" 2>/dev/null \
+      || echo '{"byUrl":{},"byHash":{}}'
+  else
+    echo '{"byUrl":{},"byHash":{}}'
+  fi
+}
+
+index_save() {
+  local json="$1"
+  jq -nc --argjson i "${json}" '$i' >"${INDEX_FILE}.tmp" 2>/dev/null \
+    && mv "${INDEX_FILE}.tmp" "${INDEX_FILE}"
+}
+
+index_lookup_url() {
+  local url_key="$1" path
+  path="$(jq -r --arg k "${url_key}" '.byUrl[$k] // empty' <<< "$(index_load)" 2>/dev/null || true)"
+  if [[ -n "${path}" && -f "${path}" ]]; then
+    echo -n "${path}"
+    return 0
+  fi
+  return 1
+}
+
+index_lookup_hash() {
+  local hash="$1" path
+  path="$(jq -r --arg k "${hash}" '.byHash[$k] // empty' <<< "$(index_load)" 2>/dev/null || true)"
+  if [[ -n "${path}" && -f "${path}" ]]; then
+    echo -n "${path}"
+    return 0
+  fi
+  return 1
+}
+
+index_remember() {
+  local url_key="$1" content_hash="$2" path="$3"
+  local idx
+  idx="$(index_load)"
+  idx="$(jq -c --arg uk "${url_key}" --arg hk "${content_hash}" --arg p "${path}" '
+    .byUrl[$uk] = $p | .byHash[$hk] = $p
+  ' <<< "${idx}")"
+  index_save "${idx}"
+}
+
+# Remove duplicate files (same content hash), keep one; rebuild byHash index.
+# Prefer keeping a currently applied / protected path when choosing the survivor.
+dedupe_library() {
+  local f hash path removed=0
+  local -A best=()
+  local -A protected=()
+  local p idx old uk up
+
+  while IFS= read -r p; do
+    [[ -n "${p}" ]] && protected["${p}"]=1
+  done < <(protect_paths)
+
+  while IFS= read -r -d '' f; do
+    hash="$(sha256_file "${f}")"
+    [[ -n "${hash}" ]] || continue
+    path="$(readlink -f "${f}" 2>/dev/null || echo "${f}")"
+    if [[ -n "${best[$hash]:-}" ]]; then
+      if [[ -n "${protected[$path]+x}" ]]; then
+        rm -f -- "${best[$hash]}" && ((++removed)) || true
+        best["${hash}"]="${path}"
+      else
+        rm -f -- "${path}" && ((++removed)) || true
+      fi
+    else
+      best["${hash}"]="${path}"
+    fi
+  done < <(find "${WALLPAPER_DIR}" -maxdepth 1 -type f \
+    \( -name 'wp-*' -o -name 'bing-*' \) ! -name '*.part' -print0 2>/dev/null)
+
+  idx='{"byUrl":{},"byHash":{}}'
+  for hash in "${!best[@]}"; do
+    path="${best[$hash]}"
+    [[ -f "${path}" ]] || continue
+    idx="$(jq -c --arg hk "${hash}" --arg p "${path}" '.byHash[$hk] = $p' <<< "${idx}")"
+  done
+
+  old="$(index_load)"
+  while IFS= read -r uk; do
+    [[ -n "${uk}" ]] || continue
+    up="$(jq -r --arg k "${uk}" '.byUrl[$k] // empty' <<< "${old}")"
+    up="$(readlink -f "${up}" 2>/dev/null || echo "${up}")"
+    [[ -n "${up}" && -f "${up}" ]] || continue
+    idx="$(jq -c --arg k "${uk}" --arg p "${up}" '.byUrl[$k] = $p' <<< "${idx}")"
+  done < <(jq -r '.byUrl | keys[]?' <<< "${old}" 2>/dev/null)
+
+  index_save "${idx}"
+  ((removed > 0)) && log_event "dedupe" "" 1 "removed=${removed}" ""
+  echo "${removed}"
+}
+
+current_wallpaper_path() {
+  local p=""
+  p="$(readlink -f "${HOME}/.local/state/omarchy/current/background" 2>/dev/null || true)"
+  if [[ -z "${p}" && -f "${STATE_DIR}/status.json" ]]; then
+    p="$(jq -r '.lastPath // empty' "${STATE_DIR}/status.json" 2>/dev/null || true)"
+    [[ -n "${p}" ]] && p="$(readlink -f "${p}" 2>/dev/null || echo "${p}")"
+  fi
+  printf '%s' "${p}"
+}
+
 download_image() {
   local image_url="$1" prefix="$2"
-  local base ext ext_lc stamp rand dest tmp
+  local base ext ext_lc stamp rand dest tmp url_key canon existing content_hash
   require_https_url "${image_url}" || return 1
-  base="${image_url%%\?*}"
+  canon="$(canonical_image_url "${image_url}")"
+  url_key="$(sha256_text "${canon}")"
+
+  if existing="$(index_lookup_url "${url_key}")"; then
+    if validate_downloaded_image "${existing}"; then
+      echo -n "${existing}"
+      return 0
+    fi
+  fi
+
+  base="${canon}"
   ext="${base##*.}"
   ext_lc="$(printf '%s' "${ext}" | tr '[:upper:]' '[:lower:]')"
   case "${ext_lc}" in
@@ -632,7 +764,19 @@ download_image() {
     rm -f "${tmp}"
     return 1
   fi
+
+  content_hash="$(sha256_file "${tmp}")"
+  if [[ -n "${content_hash}" ]] && existing="$(index_lookup_hash "${content_hash}")"; then
+    rm -f "${tmp}"
+    index_remember "${url_key}" "${content_hash}" "${existing}"
+    echo -n "${existing}"
+    return 0
+  fi
+
   mv "${tmp}" "${dest}"
+  if [[ -n "${content_hash}" ]]; then
+    index_remember "${url_key}" "${content_hash}" "${dest}"
+  fi
   echo -n "${dest}"
 }
 
@@ -700,17 +844,33 @@ prune_old() {
 try_deck() {
   local remaining_json="$1"
   local -a remaining_arr=()
-  local i src url dest=""
+  local i src url dest="" cur cur_hash dest_hash dest_abs
   DECK_IDX=-1
   DECK_SRC=""
   DECK_DEST=""
   DECK_REM="${remaining_json}"
+  cur="$(current_wallpaper_path)"
+  cur_hash=""
+  [[ -n "${cur}" && -f "${cur}" ]] && cur_hash="$(sha256_file "${cur}")"
   mapfile -t remaining_arr < <(jq -r '.[]' <<< "${remaining_json}")
   ((${#remaining_arr[@]} > 0)) || return 1
   for i in "${!remaining_arr[@]}"; do
     src="${remaining_arr[i]}"
     if url="$(try_source_by_name "${src}")"; then
       if dest="$(download_image "${url}" "${src}")"; then
+        dest_abs="$(readlink -f "${dest}" 2>/dev/null || echo "${dest}")"
+        # Same file or same bytes as the active wallpaper — try another source.
+        if [[ -n "${cur}" && "${dest_abs}" == "${cur}" ]]; then
+          log_event "attempt" "${src}" 0 "duplicate of current wallpaper" "${dest}"
+          continue
+        fi
+        if [[ -n "${cur_hash}" ]]; then
+          dest_hash="$(sha256_file "${dest}")"
+          if [[ -n "${dest_hash}" && "${dest_hash}" == "${cur_hash}" ]]; then
+            log_event "attempt" "${src}" 0 "duplicate of current wallpaper" "${dest}"
+            continue
+          fi
+        fi
         log_event "attempt" "${src}" 1 "" "${dest}"
         DECK_IDX="${i}"
         DECK_SRC="${src}"
@@ -730,13 +890,15 @@ main() {
 
   if [[ "${PURGE_ONLY}" == "1" ]]; then
     removed="$(prune_old)"
+    dedupe_library >/dev/null || true
     emit 1 "" "" "purged=${removed}"
     exit 0
   fi
 
   log_event "start" "" 1 "" ""
-  # Retention even when fetches fail later in this run.
+  # Retention + content dedupe (builds image-index for URL/hash lookups).
   prune_old >/dev/null || true
+  dedupe_library >/dev/null || true
 
   remaining_json="$(queue_load_remaining)"
   n="$(jq 'length' <<< "${remaining_json}")"
