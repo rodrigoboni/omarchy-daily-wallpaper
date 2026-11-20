@@ -68,6 +68,9 @@ NASA_SEARCH_ATTEMPTS="8"
 MATCH_RES="1"
 
 if [[ -n "${CONFIG_PATH}" && -f "${CONFIG_PATH}" ]]; then
+  # Config may hold API keys — keep it owner-readable only.
+  chmod 600 "${CONFIG_PATH}" 2>/dev/null || true
+  chmod 700 "$(dirname -- "${CONFIG_PATH}")" 2>/dev/null || true
   eval "$(jq -r '
     def s($k; $d):
       (($k | tostring) as $key
@@ -162,14 +165,27 @@ uri_encode() {
   printf '%s' "$1" | jq -rn --raw-input '@uri'
 }
 
+# Owner-only runtime dir for short-lived secret curl configs (not shared /tmp).
+curl_runtime_dir() {
+  local base="${XDG_RUNTIME_DIR:-}"
+  if [[ -z "${base}" || ! -d "${base}" ]]; then
+    base="${TMPDIR:-/tmp}"
+  fi
+  local dir="${base}/omarchy-daily-wallpaper"
+  mkdir -p "${dir}"
+  chmod 700 "${dir}" 2>/dev/null || true
+  printf '%s' "${dir}"
+}
+
 # Run curl with a temporary --config file so secrets never appear in argv.
 # Usage: curl_with_config <max-time> <config-body> [extra curl args...]
-# Config body is written to a 0600 temp file and passed via -K only.
+# Config body is written to a 0600 temp file under XDG_RUNTIME_DIR and removed after.
 curl_with_config() {
   local max_time="$1" body="$2"
   shift 2
-  local cfg ec=0
-  cfg="$(mktemp "${TMPDIR:-/tmp}/dw-curl.XXXXXX")"
+  local cfg ec=0 dir
+  dir="$(curl_runtime_dir)"
+  cfg="$(mktemp "${dir}/curl.XXXXXX")"
   chmod 600 "${cfg}"
   printf '%s\n' "${body}" >"${cfg}"
   curl -fsSL --max-time "${max_time}" -K "${cfg}" "$@" || ec=$?

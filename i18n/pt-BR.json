@@ -45,7 +45,7 @@
   "nasaApiKey": "Chave da API da NASA",
   "unsplashAccessKey": "Chave de acesso do Unsplash",
   "bingMkt": "Mercado Bing",
-  "keysHint": "As chaves ficam neste computador no arquivo de configuração e nunca vão na linha de comando do curl.",
+  "keysHint": "As chaves ficam neste computador em um arquivo de configuração privado (modo 600) e nunca vão na linha de comando do curl.",
   "source.bing": "Bing",
   "source.apod": "NASA APOD",
   "source.met": "Met Museum",

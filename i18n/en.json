@@ -45,7 +45,7 @@
   "nasaApiKey": "NASA API key",
   "unsplashAccessKey": "Unsplash access key",
   "bingMkt": "Bing market",
-  "keysHint": "Keys stay on this machine in the plugin config file and are never passed on curl command lines.",
+  "keysHint": "Keys stay on this machine in a private config file (mode 600) and are never passed on curl command lines.",
   "source.bing": "Bing",
   "source.apod": "NASA APOD",
   "source.met": "Met Museum",

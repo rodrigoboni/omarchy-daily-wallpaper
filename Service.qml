@@ -65,6 +65,21 @@ Item {
       stateDir,
       Config.expandHome(config.wallpaperDir, home)
     ])
+    hardenConfigPerms()
+  }
+
+  // Config may hold API keys — directory 700, file 600.
+  function hardenConfigPerms() {
+    Quickshell.execDetached([
+      "bash", "-lc",
+      "umask 077\n" +
+      "dir=$1; file=$2\n" +
+      "mkdir -p -- \"$dir\" && chmod 700 -- \"$dir\" || exit 0\n" +
+      "if [[ -f $file ]]; then chmod 600 -- \"$file\"; fi\n",
+      "daily-wallpaper-perms",
+      home + "/.config/omarchy/daily-wallpaper",
+      configPath
+    ])
   }
 
   function writeStatus(patch) {
@@ -79,6 +94,7 @@ Item {
     var prevKeep = Number(config.keepDays || 7)
     config = Config.mergeConfig(nextCfg, home)
     configFile.setText(Config.serializeConfig(config))
+    hardenConfigPerms()
     if (Number(config.keepDays) !== prevKeep)
       Qt.callLater(runPurgeOnly)
     scheduleNext()
@@ -404,6 +420,7 @@ Item {
       root.configReady = true
       root.ensureDirs()
       setText(Config.serializeConfig(root.config))
+      root.hardenConfigPerms()
       root.prevKeepDays = Number(root.config.keepDays)
       root.scheduleNext()
     }
