@@ -283,37 +283,58 @@ pick_query_term() {
   echo -n "${cleaned[$((RANDOM % ${#cleaned[@]}))]}"
 }
 
-# Unsplash: turn a comma list into one query with OR between terms.
-# Multi-word terms are double-quoted so they stay phrases.
-build_or_query() {
+# Parse a comma list into cleaned query terms (Unsplash / shared helpers).
+parse_query_terms() {
   local raw="${1:-}" fallback="${2:-landscape}"
-  local -a parts=() cleaned=() quoted=() p
+  local -a parts=() p
+  PARSE_QUERY_TERMS=()
   [[ -z "${raw}" ]] && raw="${KEYWORDS}"
   IFS=',' read -ra parts <<< "${raw}"
   for p in "${parts[@]}"; do
     p="${p#"${p%%[![:space:]]*}"}"
     p="${p%"${p##*[![:space:]]}"}"
     [[ -n "${p}" ]] || continue
-    # Strip wrapping quotes the user may have typed; we re-quote below.
     p="${p#\"}"
     p="${p%\"}"
     p="${p#\'}"
     p="${p%\'}"
-    [[ -n "${p}" ]] && cleaned+=("${p}")
+    [[ -n "${p}" ]] && PARSE_QUERY_TERMS+=("${p}")
   done
-  if ((${#cleaned[@]} == 0)); then
-    echo -n "${fallback}"
-    return 0
+  if ((${#PARSE_QUERY_TERMS[@]} == 0)); then
+    PARSE_QUERY_TERMS=("${fallback}")
   fi
-  for p in "${cleaned[@]}"; do
+}
+
+# Unsplash /photos/random often 404s on long OR chains. Each call OR-joins a
+# small random subset (default 3) so mixed pools still hit every theme over time.
+build_or_query() {
+  local raw="${1:-}" fallback="${2:-landscape}" max_terms="${3:-3}"
+  local -a cleaned=() picked=() quoted=() p
+  local i n idx tmp out t
+  parse_query_terms "${raw}" "${fallback}"
+  cleaned=("${PARSE_QUERY_TERMS[@]}")
+  n=${#cleaned[@]}
+  ((max_terms < 1)) && max_terms=1
+  ((max_terms > n)) && max_terms=${n}
+
+  # Partial Fisher–Yates for a random subset.
+  picked=("${cleaned[@]}")
+  for ((i = n - 1; i > 0; i--)); do
+    idx=$((RANDOM % (i + 1)))
+    tmp="${picked[i]}"
+    picked[i]="${picked[idx]}"
+    picked[idx]="${tmp}"
+  done
+  picked=("${picked[@]:0:${max_terms}}")
+
+  for p in "${picked[@]}"; do
     if [[ "${p}" == *" "* ]]; then
       quoted+=("\"${p}\"")
     else
       quoted+=("${p}")
     fi
   done
-  # Join with " OR " (Unsplash query syntax).
-  local out="" t
+  out=""
   for t in "${quoted[@]}"; do
     if [[ -z "${out}" ]]; then
       out="${t}"
@@ -325,7 +346,11 @@ build_or_query() {
 }
 
 MET_QUERY="$(pick_query_term "${MET_QUERY}" "landscape")"
-UNSPLASH_QUERY="$(build_or_query "${UNSPLASH_QUERY}" "landscape")"
+# Keep the raw comma list; build a fresh OR subset per Unsplash attempt.
+UNSPLASH_QUERY_RAW="${UNSPLASH_QUERY}"
+[[ -z "${UNSPLASH_QUERY_RAW}" ]] && UNSPLASH_QUERY_RAW="${KEYWORDS}"
+UNSPLASH_QUERY="${UNSPLASH_QUERY_RAW}"
+UNSPLASH_ATTEMPTS=4
 
 _nasa_key_ok() {
   [[ -n "${NASA_API_KEY}" ]] || return 1
@@ -558,21 +583,30 @@ try_source_met() {
 
 try_source_unsplash() {
   [[ -n "${UNSPLASH_ACCESS_KEY}" ]] || return 1
-  local json url qenc cfg_body
-  qenc="$(uri_encode "${UNSPLASH_QUERY}")"
-  # Keep Client-ID out of curl argv — only inside a 0600 -K config file.
-  cfg_body="$(printf 'header = "Authorization: Client-ID %s"' "${UNSPLASH_ACCESS_KEY}")"
-  json="$(curl_with_config 30 "${cfg_body}" \
-    "https://api.unsplash.com/photos/random?orientation=landscape&content_filter=high&query=${qenc}")" || return 1
-  url="$(jq -r '.urls.raw // .urls.full // .urls.regular // empty' <<< "${json}")"
-  [[ -n "${url}" && "${url}" != "null" ]] || return 1
-  require_https_url "${url}" || return 1
+  local json url qenc cfg_body q attempt=0
   local w="${MIN_WIDTH}"
   ((w < 1920)) && w=3840
-  case "${url}" in
-    *\?*) echo -n "${url}&w=${w}&q=85" ;;
-    *) echo -n "${url}?w=${w}&q=85" ;;
-  esac
+  # Keep Client-ID out of curl argv — only inside a 0600 -K config file.
+  cfg_body="$(printf 'header = "Authorization: Client-ID %s"' "${UNSPLASH_ACCESS_KEY}")"
+
+  while ((attempt < UNSPLASH_ATTEMPTS)); do
+    ((++attempt))
+    # Fresh 2–3 term OR subset each try — long OR lists often 404 on /photos/random.
+    q="$(build_or_query "${UNSPLASH_QUERY_RAW:-${UNSPLASH_QUERY}}" "landscape" 3)"
+    qenc="$(uri_encode "${q}")"
+    [[ -n "${qenc}" && "${qenc}" != "null" ]] || continue
+    json="$(curl_with_config 30 "${cfg_body}" \
+      "https://api.unsplash.com/photos/random?orientation=landscape&content_filter=high&query=${qenc}")" || continue
+    url="$(jq -r '.urls.raw // .urls.full // .urls.regular // empty' <<< "${json}")"
+    [[ -n "${url}" && "${url}" != "null" ]] || continue
+    require_https_url "${url}" || continue
+    case "${url}" in
+      *\?*) echo -n "${url}&w=${w}&q=85" ;;
+      *) echo -n "${url}?w=${w}&q=85" ;;
+    esac
+    return 0
+  done
+  return 1
 }
 
 try_source_by_name() {

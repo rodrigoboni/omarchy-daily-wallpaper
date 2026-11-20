@@ -34,7 +34,7 @@
   "keywords": "Keywords",
   "keywordsHint": "Comma-separated subjects for NASA Images (and defaults for Met / Unsplash when their fields are empty).",
   "metQuery": "Met Museum query",
-  "unsplashQuery": "Unsplash query (comma list → OR)",
+  "unsplashQuery": "Unsplash query pool (comma list, OR subset)",
   "matchResolution": "Match display resolution",
   "matchResolutionHint": "Prefer images at least as large as your biggest monitor.",
   "applyToLock": "Also set lock screen",
