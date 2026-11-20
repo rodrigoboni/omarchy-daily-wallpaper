@@ -165,31 +165,66 @@ uri_encode() {
   printf '%s' "$1" | jq -rn --raw-input '@uri'
 }
 
-# Owner-only runtime dir for short-lived secret curl configs (not shared /tmp).
-curl_runtime_dir() {
-  local base="${XDG_RUNTIME_DIR:-}"
-  if [[ -z "${base}" || ! -d "${base}" ]]; then
-    base="${TMPDIR:-/tmp}"
+# Ensure dir is a real directory we own with mode 700. Never follow/trust a
+# pre-existing shared location another account could have planted.
+_secure_owner_dir() {
+  local dir="$1" uid mode
+  uid="$(id -u)"
+  if [[ -L "${dir}" ]]; then
+    return 1
   fi
-  local dir="${base}/omarchy-daily-wallpaper"
-  mkdir -p "${dir}"
-  chmod 700 "${dir}" 2>/dev/null || true
-  printf '%s' "${dir}"
+  if [[ -e "${dir}" ]]; then
+    [[ -d "${dir}" ]] || return 1
+  else
+    (umask 077; mkdir -p -- "${dir}") || return 1
+  fi
+  [[ ! -L "${dir}" && -d "${dir}" ]] || return 1
+  mode="$(stat -c '%a' "${dir}" 2>/dev/null || true)"
+  [[ "$(stat -c '%u' "${dir}" 2>/dev/null || true)" == "${uid}" ]] || return 1
+  if [[ "${mode}" != "700" ]]; then
+    chmod 700 -- "${dir}" || return 1
+    mode="$(stat -c '%a' "${dir}" 2>/dev/null || true)"
+    [[ "${mode}" == "700" ]] || return 1
+  fi
+  [[ "$(stat -c '%u' "${dir}" 2>/dev/null || true)" == "${uid}" ]] || return 1
+  return 0
+}
+
+# Private parent for short-lived secret curl configs.
+# Prefer XDG_RUNTIME_DIR; otherwise a HOME state path. Never shared /tmp.
+curl_runtime_parent() {
+  local parent
+  if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR}" ]]; then
+    # Runtime dir itself must be ours (typical /run/user/$UID).
+    [[ "$(stat -c '%u' "${XDG_RUNTIME_DIR}" 2>/dev/null || true)" == "$(id -u)" ]] || return 1
+    parent="${XDG_RUNTIME_DIR}/omarchy-daily-wallpaper"
+  else
+    parent="${XDG_STATE_HOME:-${HOME}/.local/state}/omarchy/daily-wallpaper/runtime"
+  fi
+  _secure_owner_dir "${parent}" || return 1
+  printf '%s' "${parent}"
 }
 
 # Run curl with a temporary --config file so secrets never appear in argv.
 # Usage: curl_with_config <max-time> <config-body> [extra curl args...]
-# Config body is written to a 0600 temp file under XDG_RUNTIME_DIR and removed after.
+# Config lives in a fresh 0700 directory we own (under XDG_RUNTIME_DIR or
+# private HOME state), never in shared /tmp.
 curl_with_config() {
   local max_time="$1" body="$2"
   shift 2
-  local cfg ec=0 dir
-  dir="$(curl_runtime_dir)"
-  cfg="$(mktemp "${dir}/curl.XXXXXX")"
-  chmod 600 "${cfg}"
+  local parent work cfg ec=0
+  parent="$(curl_runtime_parent)" || return 1
+  work="$(umask 077; mktemp -d "${parent}/curl.XXXXXX")" || return 1
+  if ! _secure_owner_dir "${work}"; then
+    rm -rf -- "${work}"
+    return 1
+  fi
+  cfg="${work}/config"
+  (umask 077; : >"${cfg}") || { rm -rf -- "${work}"; return 1; }
+  chmod 600 -- "${cfg}" || { rm -rf -- "${work}"; return 1; }
   printf '%s\n' "${body}" >"${cfg}"
   curl -fsSL --max-time "${max_time}" -K "${cfg}" "$@" || ec=$?
-  rm -f "${cfg}"
+  rm -rf -- "${work}"
   return "${ec}"
 }
 

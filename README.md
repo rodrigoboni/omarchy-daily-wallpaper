@@ -85,7 +85,7 @@ File: `~/.config/omarchy/daily-wallpaper/config.json`
 | `apod` | NASA | Astronomy Picture of the Day |
 | `unsplash` | Unsplash | Random landscape photo |
 
-Keys stay only in `config.json` on this machine (directory mode `700`, file mode `600`). They are never written to the fetch log, never returned by IPC `status` (shown as `(set)`), and are passed to curl through a temporary mode-`0600` `--config` file under `$XDG_RUNTIME_DIR` so they do not appear on the process command line or in shared `/tmp`. URI-encoding also feeds secrets to `jq` on stdin (not `--arg`) so they never land in helper-process argv either.
+Keys stay only in `config.json` on this machine (directory mode `700`, file mode `600`). They are never written to the fetch log, never returned by IPC `status` (shown as `(set)`), and are passed to curl through a temporary mode-`0600` `--config` file in a fresh owner-only `0700` directory under `$XDG_RUNTIME_DIR` (or private HOME state if unset) — never shared `/tmp`. That directory is refused unless owned by the current user with mode `700`. URI-encoding also feeds secrets to `jq` on stdin (not `--arg`) so they never land in helper-process argv either.
 
 NASA key: https://api.nasa.gov/  
 Unsplash access key: https://unsplash.com/oauth/applications
@@ -166,7 +166,7 @@ Deck state: `queue.json` → `{ "remaining": ["unsplash","bing",…] }`. Empty �
 
 ### Secrets and curl
 
-NASA and Unsplash credentials are written only into a temporary curl `--config` (`-K`) file with mode `0600` under `$XDG_RUNTIME_DIR/omarchy-daily-wallpaper/` (not shared `/tmp`), then deleted. Do not put API keys in curl argv (`-H`, URL query, etc.). Config containing keys is kept at mode `600`.
+NASA and Unsplash credentials are written only into a temporary curl `--config` (`-K`) file with mode `0600` inside a fresh owner-verified `0700` directory under `$XDG_RUNTIME_DIR/omarchy-daily-wallpaper/` (HOME state fallback; never shared `/tmp`), then deleted. Do not put API keys in curl argv (`-H`, URL query, etc.). Config containing keys is kept at mode `600`.
 
 ### IPC
 
