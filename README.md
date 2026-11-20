@@ -68,7 +68,7 @@ File: `~/.config/omarchy/daily-wallpaper/config.json`
 | `sources` | `["bing","nasa_images","met"]` | Enabled source ids (see below) |
 | `keywords` | (space/astronomy list) | Comma-separated subjects for NASA Images; also default Met/Unsplash term pool |
 | `metQuery` | `""` | Met search string (or comma list → one term picked at random) |
-| `unsplashQuery` | `""` | Unsplash query (same comma-list behavior) |
+| `unsplashQuery` | `""` | Unsplash query (comma list → one `term1 OR term2 OR …` query; multi-word terms quoted) |
 | `matchResolution` | `true` | Prefer images at least as large as the biggest monitor |
 | `applyToLockScreen` | `true` | Set Omarchy lock/desktop background together |
 | `notifyOnChange` | `true` | Desktop notification after a successful change |

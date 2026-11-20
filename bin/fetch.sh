@@ -263,7 +263,7 @@ BING_IDX="$(_normalize_int "${BING_IDX}" 0)"
 NASA_MAX_PAGE="$(_normalize_int "${NASA_MAX_PAGE}" 10)"
 NASA_SEARCH_ATTEMPTS="$(_normalize_int "${NASA_SEARCH_ATTEMPTS}" 8)"
 
-# Met / Unsplash accept one subject string. If the user pastes a comma list
+# Met accepts one subject string. If the user pastes a comma list
 # (same style as keywords), pick one term at random each run.
 pick_query_term() {
   local raw="${1:-}" fallback="${2:-landscape}"
@@ -282,8 +282,49 @@ pick_query_term() {
   echo -n "${cleaned[$((RANDOM % ${#cleaned[@]}))]}"
 }
 
+# Unsplash: turn a comma list into one query with OR between terms.
+# Multi-word terms are double-quoted so they stay phrases.
+build_or_query() {
+  local raw="${1:-}" fallback="${2:-landscape}"
+  local -a parts=() cleaned=() quoted=() p
+  [[ -z "${raw}" ]] && raw="${KEYWORDS}"
+  IFS=',' read -ra parts <<< "${raw}"
+  for p in "${parts[@]}"; do
+    p="${p#"${p%%[![:space:]]*}"}"
+    p="${p%"${p##*[![:space:]]}"}"
+    [[ -n "${p}" ]] || continue
+    # Strip wrapping quotes the user may have typed; we re-quote below.
+    p="${p#\"}"
+    p="${p%\"}"
+    p="${p#\'}"
+    p="${p%\'}"
+    [[ -n "${p}" ]] && cleaned+=("${p}")
+  done
+  if ((${#cleaned[@]} == 0)); then
+    echo -n "${fallback}"
+    return 0
+  fi
+  for p in "${cleaned[@]}"; do
+    if [[ "${p}" == *" "* ]]; then
+      quoted+=("\"${p}\"")
+    else
+      quoted+=("${p}")
+    fi
+  done
+  # Join with " OR " (Unsplash query syntax).
+  local out="" t
+  for t in "${quoted[@]}"; do
+    if [[ -z "${out}" ]]; then
+      out="${t}"
+    else
+      out="${out} OR ${t}"
+    fi
+  done
+  echo -n "${out}"
+}
+
 MET_QUERY="$(pick_query_term "${MET_QUERY}" "landscape")"
-UNSPLASH_QUERY="$(pick_query_term "${UNSPLASH_QUERY}" "landscape")"
+UNSPLASH_QUERY="$(build_or_query "${UNSPLASH_QUERY}" "landscape")"
 
 _nasa_key_ok() {
   [[ -n "${NASA_API_KEY}" ]] || return 1
