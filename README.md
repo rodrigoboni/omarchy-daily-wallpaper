@@ -5,7 +5,7 @@ Multi-source rotating wallpaper plugin for [Omarchy](https://omarchy.org/).
 Fetches wallpapers from Bing, NASA APOD, NASA Image Library, Met Museum, and Unsplash on a schedule (or on demand), with resolution filtering, local retention, OS-aware deferrals, and optional lock-screen sync.
 
 Plugin id: `rodrigoboni.daily-wallpaper`  
-Marketplace: [plugins.omarchy.org](https://plugins.omarchy.org/publish.html)
+Marketplace: [Daily Wallpaper on plugins.omarchy.org](https://plugins.omarchy.org/plugin.html?id=rodrigoboni.daily-wallpaper)
 
 ## Install
 
