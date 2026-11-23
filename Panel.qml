@@ -19,6 +19,10 @@ Panel {
   property bool cursorActive: false
   property int focusIndex: 0
 
+  // Relative "Next in …" reads this instead of Date.now() so the label
+  // keeps updating while the panel sits open.
+  property double nowMs: Date.now()
+
   readonly property var barIdentity: hostWidget || root
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.55)
@@ -61,7 +65,7 @@ Panel {
 
   readonly property string nextLabel: {
     if (!rotationEnabled || nextRunAt === "") return ""
-    var ms = Date.parse(nextRunAt) - Date.now()
+    var ms = Date.parse(nextRunAt) - nowMs
     if (!isFinite(ms) || ms < 0) return strings.t("idle")
     var minutes = Math.round(ms / 60000)
     if (minutes < 60) return strings.t("nextIn").arg(strings.tn("minutes", Math.max(1, minutes)).arg(Commons.I18n.formatNumber(Math.max(1, minutes))))
@@ -217,12 +221,21 @@ Panel {
   }
 
   onOpenedChanged: if (opened) {
+    nowMs = Date.now()
     cursorActive = false
     focusIndex = 0
     if (service && service.refreshLog) service.refreshLog()
     if (panel.loadedContent && panel.loadedContent.panelFlick)
       panel.loadedContent.panelFlick.contentY = 0
     Qt.callLater(function() { if (panel.loadedContent) panel.loadedContent.forceActiveFocus() })
+  }
+
+  // Keep "Next in …" honest while the panel is open (minute-granularity display).
+  Timer {
+    interval: 30000
+    running: root.opened
+    repeat: true
+    onTriggered: root.nowMs = Date.now()
   }
 
   KeyboardPanel {
