@@ -159,7 +159,7 @@ rodrigoboni.daily-wallpaper/
 
 ### Runtime flow
 
-1. `Service` schedules the next run from `lastSuccessAt + intervalHours`, or a short first-run delay.
+1. `Service` schedules the next run from `lastSuccessAt + intervalHours` (or ~5s if that time is already past — catch-up after reboot/sleep), or a short first-run delay (~15s).
 2. On fire (scheduled only): check sleep flag, DPMS via `hyprctl monitors -j`, optional `UPower.onBattery`.
 3. If blocked → set `status.skipReason`, poll ~60s / on resume / on AC restore, then retry when due.
 4. Otherwise: resolve monitor minimums → `bin/fetch.sh --config … --min-width … --min-height … --protect <lastPath>`.

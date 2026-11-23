@@ -191,8 +191,10 @@ Item {
       if (afterRun === true) {
         nextMs = Date.now() + intervalMs
       } else if (isFinite(last) && last > 0) {
+        // Anchor to last success. If already overdue (reboot / long sleep),
+        // the floor below fires a catch-up soon; DPMS/sleep/battery gates
+        // still apply when the timer runs.
         nextMs = last + intervalMs
-        if (nextMs <= Date.now() + 1000) nextMs = Date.now() + intervalMs
       } else {
         nextMs = Date.now() + 15000
       }
