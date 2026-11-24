@@ -69,17 +69,45 @@ Item {
   }
 
   // Config may hold API keys — directory 700, file 600.
+  // Only chmod when mode is wrong: unconditional chmod updates ctime and
+  // FileView watchChanges (ATTRIB) re-fires onLoaded → scheduleNext forever.
   function hardenConfigPerms() {
     Quickshell.execDetached([
       "bash", "-lc",
       "umask 077\n" +
       "dir=$1; file=$2\n" +
-      "mkdir -p -- \"$dir\" && chmod 700 -- \"$dir\" || exit 0\n" +
-      "if [[ -f $file ]]; then chmod 600 -- \"$file\"; fi\n",
+      "mkdir -p -- \"$dir\" || exit 0\n" +
+      "dmode=$(stat -c '%a' -- \"$dir\" 2>/dev/null || echo \"\")\n" +
+      "[[ $dmode == 700 ]] || chmod 700 -- \"$dir\" || exit 0\n" +
+      "if [[ -f $file ]]; then\n" +
+      "  fmode=$(stat -c '%a' -- \"$file\" 2>/dev/null || echo \"\")\n" +
+      "  [[ $fmode == 600 ]] || chmod 600 -- \"$file\"\n" +
+      "fi\n",
       "daily-wallpaper-perms",
       home + "/.config/omarchy/daily-wallpaper",
       configPath
     ])
+  }
+
+  function setSleeping(next) {
+    var want = next === true
+    if (sleeping === want) return
+    sleeping = want
+    if (want) {
+      if (status.skipReason !== "sleeping")
+        writeStatus({ skipReason: "sleeping" })
+    } else {
+      if (status.skipReason === "sleeping")
+        writeStatus({ skipReason: "" })
+      Qt.callLater(requestGateRecheck)
+    }
+  }
+
+  // Edge-triggered PrepareForSleep can be missed across deep suspend; re-read
+  // logind when we think we are asleep before giving up on a flush.
+  function refreshSleepState() {
+    if (!sleepStateProc.running)
+      sleepStateProc.running = true
   }
 
   function writeStatus(patch) {
@@ -236,6 +264,8 @@ Item {
     if (!forceFetch) {
       var blocked = scheduledBlockedReason()
       if (blocked) {
+        if (blocked === "sleeping")
+          refreshSleepState()
         deferScheduled(blocked)
         return
       }
@@ -379,7 +409,11 @@ Item {
   }
 
   function tryFlushDeferred() {
-    if (!enabled || busy || sleeping) return
+    if (!enabled || busy) return
+    if (sleeping) {
+      refreshSleepState()
+      return
+    }
     var blocked = scheduledBlockedReason()
     if (blocked) {
       deferScheduled(blocked)
@@ -411,7 +445,7 @@ Item {
     onLoaded: {
       root.config = Config.parseConfigText(text(), root.home)
       root.configReady = true
-      root.ensureDirs()
+      // Avoid ensureDirs/harden here: chmod ATTRIB retriggers this handler.
       if (root.prevKeepDays >= 0 && root.prevKeepDays !== Number(root.config.keepDays))
         Qt.callLater(root.runPurgeOnly)
       root.prevKeepDays = Number(root.config.keepDays)
@@ -422,7 +456,6 @@ Item {
       root.configReady = true
       root.ensureDirs()
       setText(Config.serializeConfig(root.config))
-      root.hardenConfigPerms()
       root.prevKeepDays = Number(root.config.keepDays)
       root.scheduleNext()
     }
@@ -526,15 +559,10 @@ Item {
     stdout: SplitParser {
       onRead: function(line) {
         var s = String(line || "")
-        if (s.indexOf("PrepareForSleep") < 0) return
-        if (s.indexOf("true") >= 0) {
-          root.sleeping = true
-          if (root.status.skipReason !== "sleeping")
-            root.writeStatus({ skipReason: "sleeping" })
-        } else if (s.indexOf("false") >= 0) {
-          root.sleeping = false
-          Qt.callLater(root.requestGateRecheck)
-        }
+        // Prefer the PrepareForSleep signal; ignore PreparingForSleep property noise.
+        var m = s.match(/\.PrepareForSleep\s*\(\s*(true|false)/)
+        if (!m) return
+        root.setSleeping(m[1] === "true")
       }
     }
     onExited: function() {
@@ -550,6 +578,32 @@ Item {
     onTriggered: {
       if (!sleepMonitorProc.running)
         sleepMonitorProc.running = true
+      // Monitor may have missed the wake edge while dead — re-sync.
+      root.refreshSleepState()
+    }
+  }
+
+  // Authoritative sleep flag when the edge-triggered monitor misses a resume.
+  Process {
+    id: sleepStateProc
+    command: [
+      "busctl", "get-property",
+      "org.freedesktop.login1",
+      "/org/freedesktop/login1",
+      "org.freedesktop.login1.Manager",
+      "PreparingForSleep"
+    ]
+    stdout: StdioCollector {
+      id: sleepStateOut
+      waitForEnd: true
+    }
+    onExited: function() {
+      var t = String(sleepStateOut.text || "").trim()
+      // busctl prints: b false   /   b true
+      if (t.indexOf("true") >= 0)
+        root.setSleeping(true)
+      else if (t.indexOf("false") >= 0)
+        root.setSleeping(false)
     }
   }
 
@@ -597,7 +651,7 @@ Item {
     repeat: true
     onTriggered: {
       if (!root.enabled || root.busy) return
-      if (root.deferredDue) {
+      if (root.sleeping || root.deferredDue) {
         root.tryFlushDeferred()
         return
       }
@@ -684,6 +738,7 @@ Item {
 
   Component.onCompleted: {
     ensureDirs()
+    refreshSleepState()
     if (!configReady) configFile.reload()
     statusFile.reload()
     logFile.reload()
