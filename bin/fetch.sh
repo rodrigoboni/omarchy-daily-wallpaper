@@ -693,9 +693,35 @@ sha256_file() {
 
 # Canonicalize provider URLs so ephemeral resize params don't defeat URL dedupe
 # (Unsplash w=/q=, etc.). Path + host still distinguish distinct assets.
+# Bing is special: image identity is only in ?id= — stripping the query would
+# collapse every Bing wallpaper to https://www.bing.com/th.
 canonical_image_url() {
-  local url="${1%%\?*}"
-  printf '%s' "${url}"
+  local url="${1}"
+  local base="${url%%\?*}"
+  local qs id
+
+  case "${base}" in
+    https://www.bing.com/th | https://bing.com/th)
+      if [[ "${url}" == *"?"* ]]; then
+        qs="${url#*\?}"
+        # Prefer id=…; ignore other tracking params.
+        if [[ "${qs}" =~ (^|&)id=([^&]+) ]]; then
+          id="${BASH_REMATCH[2]}"
+          # Same OHR at UHD/1920/1280 should share one cache key.
+          id="${id%_UHD.jpg}"
+          id="${id%_1920x1080.jpg}"
+          id="${id%_1280x720.jpg}"
+          printf '%s?id=%s' "${base}" "${id}"
+          return 0
+        fi
+      fi
+      # Unknown Bing shape — keep the full URL rather than collapsing.
+      printf '%s' "${url%%\#*}"
+      return 0
+      ;;
+  esac
+
+  printf '%s' "${base}"
 }
 
 index_load() {
@@ -780,9 +806,14 @@ dedupe_library() {
     idx="$(jq -c --arg hk "${hash}" --arg p "${path}" '.byHash[$hk] = $p' <<< "${idx}")"
   done
 
+  # Drop pre-1.0.14 keys that hashed every Bing URL to https://www.bing.com/th.
+  local collapsed_bing
+  collapsed_bing="$(sha256_text 'https://www.bing.com/th')"
+
   old="$(index_load)"
   while IFS= read -r uk; do
     [[ -n "${uk}" ]] || continue
+    [[ "${uk}" == "${collapsed_bing}" ]] && continue
     up="$(jq -r --arg k "${uk}" '.byUrl[$k] // empty' <<< "${old}")"
     up="$(readlink -f "${up}" 2>/dev/null || echo "${up}")"
     [[ -n "${up}" && -f "${up}" ]] || continue
@@ -804,13 +835,18 @@ current_wallpaper_path() {
   printf '%s' "${p}"
 }
 
-# Set by download_image: 1 when an existing local file was reused (no new bytes).
+# Set by download_image (must not run under command substitution — that would
+# lose these in a subshell):
+#   DOWNLOAD_PATH   absolute path of the file to use
+#   DOWNLOAD_REUSED 1 when an existing local file was reused (no new bytes)
 DOWNLOAD_REUSED=0
+DOWNLOAD_PATH=""
 
 download_image() {
   local image_url="$1" prefix="$2"
-  local base ext ext_lc stamp rand dest tmp url_key canon existing content_hash
+  local ext_lc stamp rand dest tmp url_key canon existing content_hash
   DOWNLOAD_REUSED=0
+  DOWNLOAD_PATH=""
   require_https_url "${image_url}" || return 1
   canon="$(canonical_image_url "${image_url}")"
   url_key="$(sha256_text "${canon}")"
@@ -818,14 +854,16 @@ download_image() {
   if existing="$(index_lookup_url "${url_key}")"; then
     if validate_downloaded_image "${existing}"; then
       DOWNLOAD_REUSED=1
-      echo -n "${existing}"
+      DOWNLOAD_PATH="${existing}"
       return 0
     fi
   fi
 
-  base="${canon}"
-  ext="${base##*.}"
-  ext_lc="$(printf '%s' "${ext}" | tr '[:upper:]' '[:lower:]')"
+  # Extension from the download URL (Bing embeds .jpg inside ?id=…_UHD.jpg).
+  ext_lc="jpg"
+  if [[ "${image_url}" =~ \.([A-Za-z0-9]+)([?#]|$) ]]; then
+    ext_lc="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
+  fi
   case "${ext_lc}" in
     jpg | jpeg | png | webp | gif) ;;
     *) ext_lc="jpg" ;;
@@ -851,7 +889,7 @@ download_image() {
     rm -f "${tmp}"
     index_remember "${url_key}" "${content_hash}" "${existing}"
     DOWNLOAD_REUSED=1
-    echo -n "${existing}"
+    DOWNLOAD_PATH="${existing}"
     return 0
   fi
 
@@ -860,7 +898,8 @@ download_image() {
     index_remember "${url_key}" "${content_hash}" "${dest}"
   fi
   DOWNLOAD_REUSED=0
-  echo -n "${dest}"
+  DOWNLOAD_PATH="${dest}"
+  return 0
 }
 
 apply_wallpaper() {
@@ -947,7 +986,8 @@ try_deck() {
     # Ignore stale queue entries for sources the user disabled.
     [[ -n "${eligible_set[$src]+x}" ]] || continue
     if url="$(try_source_by_name "${src}")"; then
-      if dest="$(download_image "${url}" "${src}")"; then
+      if download_image "${url}" "${src}"; then
+        dest="${DOWNLOAD_PATH}"
         dest_abs="$(readlink -f "${dest}" 2>/dev/null || echo "${dest}")"
         # Already on disk from a previous fetch (e.g. Bing's same daily URL) —
         # skip so we do not keep re-applying the same image.

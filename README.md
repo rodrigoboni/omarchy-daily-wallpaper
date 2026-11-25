@@ -53,7 +53,7 @@ Optional bar setting **Show source label** shows the last source next to the ico
 - Apply to desktop and lock screen via Omarchy backgrounds
 - Panel status summary (result, source, time, next run, skip/retry hints); full JSONL via **Open log**
 - HTTPS-only image URLs/redirects; download size and decoded-pixel caps before applying a wallpaper
-- Dedupes stored wallpapers by URL and content hash (no repeated downloads of the same image)
+- Dedupes stored wallpapers by URL and content hash (no repeated downloads of the same image). Bing keeps `?id=` (image identity lives in the query string); Unsplash/NASA/Met/APOD strip resize/tracking query params so the same asset is not stored twice.
 
 ## Config reference
 
