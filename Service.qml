@@ -326,6 +326,18 @@ Item {
     purgeProc.running = true
   }
 
+  function sanitizeError(text) {
+    var s = String(text || "").replace(/[\r\n\t]+/g, " ").trim()
+    if (s.length > 240) s = s.slice(0, 237) + "..."
+    return s
+  }
+
+  function sanitizeSource(id) {
+    var s = String(id || "").trim()
+    if (Config.SOURCE_IDS.indexOf(s) >= 0) return s
+    return ""
+  }
+
   function handleFetchResult(raw, exitCode) {
     var wasForced = forceFetch
     forceFetch = false
@@ -339,21 +351,22 @@ Item {
     if (exitCode !== 0 && !result.error)
       result.error = "fetch exited with code " + exitCode
 
+    var source = sanitizeSource(result.source)
     var patch = {
       busy: false,
       lastRunAt: new Date().toISOString(),
-      lastError: result.ok ? "" : String(result.error || "fetch failed"),
+      lastError: result.ok ? "" : sanitizeError(result.error || "fetch failed"),
       skipReason: ""
     }
 
     if (result.ok) {
       patch.lastSuccessAt = patch.lastRunAt
-      patch.lastSource = String(result.source || "")
+      patch.lastSource = source
       patch.lastPath = String(result.path || "")
       patch.lastResult = "success"
       patch.retryCount = 0
       if (config.notifyOnChange) {
-        var label = patch.lastSource || "wallpaper"
+        var label = source || "wallpaper"
         Quickshell.execDetached([
           "omarchy-notification-send",
           "Wallpaper updated",
@@ -535,8 +548,11 @@ Item {
     }
     onExited: function(exitCode) {
       var raw = fetchOut.text || ""
-      if (!String(raw).trim() && fetchErr.text)
-        raw = JSON.stringify({ ok: false, error: String(fetchErr.text).trim().split("\n").pop() })
+      if (!String(raw).trim() && fetchErr.text) {
+        var errLine = String(fetchErr.text).trim().split("\n").pop()
+        if (errLine.length > 240) errLine = errLine.slice(0, 237) + "..."
+        raw = JSON.stringify({ ok: false, error: errLine })
+      }
       root.handleFetchResult(raw, exitCode)
     }
   }

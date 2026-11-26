@@ -52,7 +52,7 @@ Optional bar setting **Show source label** shows the last source next to the ico
 - **Change now** always runs (bypasses those skip gates)
 - Apply to desktop and lock screen via Omarchy backgrounds
 - Panel status summary (result, source, time, next run, skip/retry hints); full JSONL via **Open log**
-- HTTPS-only image URLs/redirects; download size and decoded-pixel caps before applying a wallpaper
+- HTTPS-only image URLs/redirects; download size and decoded-pixel caps before applying a wallpaper; API JSON responses capped at 4 MiB
 - Dedupes stored wallpapers by URL and content hash (no repeated downloads of the same image). Bing keeps `?id=` (image identity lives in the query string); Unsplash/NASA/Met/APOD strip resize/tracking query params so the same asset is not stored twice.
 
 ## Config reference
@@ -188,6 +188,8 @@ Log events (`fetch.log` JSONL): `start`, `attempt`, `reshuffle`, `run`, `purge`.
 Deck state: `queue.json` → `{ "remaining": ["unsplash","bing",…] }`. Empty → reshuffle from eligible configured sources.
 
 Image downloads require `https://` URLs, use `--proto '=https' --proto-redir '=https'`, enforce `--max-filesize` / on-disk byte caps (2 KiB–50 MiB), require an image MIME type, and (when ImageMagick is available) cap decoded pixels at 100 MP and honor `--min-width` / `--min-height`. Failed or invalid downloads never reach `apply_wallpaper`.
+
+API / metadata responses (Bing, NASA, Met, Unsplash) are also bounded: written to a private temp file with `--max-filesize` and a hard 4 MiB on-disk cap before being read into the shell — never an uncapped stream into a variable.
 
 ### Secrets and curl
 

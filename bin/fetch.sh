@@ -209,12 +209,12 @@ curl_runtime_parent() {
 
 # Run curl with a temporary --config file so secrets never appear in argv.
 # Usage: curl_with_config <max-time> <config-body> [extra curl args...]
-# Config lives in a fresh 0700 directory we own (under XDG_RUNTIME_DIR or
-# private HOME state), never in shared /tmp.
+# Prints the response body to stdout (bounded). Config lives in a fresh 0700
+# directory we own (under XDG_RUNTIME_DIR or private HOME state), never /tmp.
 curl_with_config() {
   local max_time="$1" body="$2"
   shift 2
-  local parent work cfg ec=0
+  local parent work cfg out ec=0 size
   parent="$(curl_runtime_parent)" || return 1
   work="$(umask 077; mktemp -d "${parent}/curl.XXXXXX")" || return 1
   if ! _secure_owner_dir "${work}"; then
@@ -222,10 +222,22 @@ curl_with_config() {
     return 1
   fi
   cfg="${work}/config"
-  (umask 077; : >"${cfg}") || { rm -rf -- "${work}"; return 1; }
-  chmod 600 -- "${cfg}" || { rm -rf -- "${work}"; return 1; }
+  out="${work}/body"
+  (umask 077; : >"${cfg}"; : >"${out}") || { rm -rf -- "${work}"; return 1; }
+  chmod 600 -- "${cfg}" "${out}" || { rm -rf -- "${work}"; return 1; }
   printf '%s\n' "${body}" >"${cfg}"
-  curl_https -fsSL --max-time "${max_time}" -K "${cfg}" "$@" || ec=$?
+  # Bound on-disk and refuse oversized Content-Length when advertised.
+  if ! curl_https -fsSL --max-time "${max_time}" --max-filesize "${MAX_API_BYTES}" \
+      -K "${cfg}" "$@" -o "${out}"; then
+    rm -rf -- "${work}"
+    return 1
+  fi
+  size="$(stat -c '%s' -- "${out}" 2>/dev/null || echo 0)"
+  if ! [[ "${size}" =~ ^[0-9]+$ ]] || ((size > MAX_API_BYTES)); then
+    rm -rf -- "${work}"
+    return 1
+  fi
+  cat -- "${out}" || ec=$?
   rm -rf -- "${work}"
   return "${ec}"
 }
@@ -233,6 +245,39 @@ curl_with_config() {
 # HTTPS only for requests and redirects (provider URLs / CDNs).
 curl_https() {
   curl --proto '=https' --proto-redir '=https' "$@"
+}
+
+# Fetch a bounded HTTPS body into stdout (API JSON / metadata). Fail closed
+# if the transfer exceeds MAX_API_BYTES — never stream an unbounded response
+# into a shell variable (same class of issue as uncapped yt-dlp captures).
+# Usage: curl_https_body <max-time> [curl args...] <url>
+curl_https_body() {
+  local max_time="$1"
+  shift
+  local parent work out size
+  parent="$(curl_runtime_parent)" || return 1
+  work="$(umask 077; mktemp -d "${parent}/body.XXXXXX")" || return 1
+  if ! _secure_owner_dir "${work}"; then
+    rm -rf -- "${work}"
+    return 1
+  fi
+  out="${work}/body"
+  (umask 077; : >"${out}") || { rm -rf -- "${work}"; return 1; }
+  chmod 600 -- "${out}" || { rm -rf -- "${work}"; return 1; }
+  if ! curl_https -fsSL --max-time "${max_time}" --max-filesize "${MAX_API_BYTES}" \
+      "$@" -o "${out}"; then
+    rm -rf -- "${work}"
+    return 1
+  fi
+  size="$(stat -c '%s' -- "${out}" 2>/dev/null || echo 0)"
+  if ! [[ "${size}" =~ ^[0-9]+$ ]] || ((size > MAX_API_BYTES)); then
+    rm -rf -- "${work}"
+    return 1
+  fi
+  cat -- "${out}"
+  local ec=$?
+  rm -rf -- "${work}"
+  return "${ec}"
 }
 
 require_https_url() {
@@ -246,6 +291,8 @@ require_https_url() {
 MAX_DOWNLOAD_BYTES=$((50 * 1024 * 1024))   # 50 MiB on the wire
 MIN_DOWNLOAD_BYTES=2048                    # reject empty / tiny failures
 MAX_DECODED_PIXELS=$((100 * 1000 * 1000))  # 100 megapixels decoded
+# Metadata / API JSON responses (never load unbounded bodies into memory).
+MAX_API_BYTES=$((4 * 1024 * 1024))         # 4 MiB
 
 _normalize_int() {
   local v="${1}" d="${2}"
@@ -420,7 +467,7 @@ validate_downloaded_image() {
 # --- Bing ---
 
 fetch_bing_json() {
-  curl_https -fsSL --max-time 30 \
+  curl_https_body 30 \
     "https://www.bing.com/HPImageArchive.aspx?format=js&idx=${BING_IDX}&n=${BING_IMAGE_COUNT}&mkt=${BING_MKT}"
 }
 
@@ -537,7 +584,7 @@ try_source_nasa_images() {
     q="$(pick_random_query)" || return 1
     page=$((RANDOM % (NASA_MAX_PAGE + 1)))
     url="https://images-api.nasa.gov/search?q=$(uri_encode "${q}")&media_type=image&page=${page}"
-    json="$(curl_https -fsSL --max-time 30 "${url}")" || {
+    json="$(curl_https_body 30 "${url}")" || {
       ((++attempts))
       continue
     }
@@ -563,7 +610,7 @@ try_source_nasa_images() {
 try_source_met() {
   local json total n oid detail url maxpick qenc
   qenc="$(uri_encode "${MET_QUERY}")"
-  json="$(curl_https -fsSL --max-time 30 "https://collectionapi.metmuseum.org/public/collection/v1/search?hasImages=true&q=${qenc}")" || return 1
+  json="$(curl_https_body 30 "https://collectionapi.metmuseum.org/public/collection/v1/search?hasImages=true&q=${qenc}")" || return 1
   total="$(jq '.total // 0' <<< "${json}")"
   ((total > 0)) || return 1
   n="$(jq '[.objectIDs[]?] | length' <<< "${json}")"
@@ -572,7 +619,7 @@ try_source_met() {
   ((n > maxpick)) && n=${maxpick}
   oid="$(jq -r --argjson r "${RANDOM}" --argjson lim "${n}" '.objectIDs[0:$lim] | .[$r % length]' <<< "${json}")"
   [[ -n "${oid}" && "${oid}" != "null" ]] || return 1
-  detail="$(curl_https -fsSL --max-time 30 "https://collectionapi.metmuseum.org/public/collection/v1/objects/${oid}")" || return 1
+  detail="$(curl_https_body 30 "https://collectionapi.metmuseum.org/public/collection/v1/objects/${oid}")" || return 1
   url="$(jq -r '.primaryImage // empty' <<< "${detail}")"
   [[ -n "${url}" && "${url}" != "null" ]] || return 1
   require_https_url "${url}" || return 1
